@@ -1,0 +1,131 @@
+# --- Secrets: never commit ---
+secrets.yaml
+esphome/secrets.yaml
+**/secrets.yaml
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials.json
+service-account*.json
+.env
+.env.*
+!.env.example
+
+# --- Home Assistant runtime state ---
+.storage/
+.cloud/
+.google.token
+.uuid
+tts/
+deps/
+backups/
+tmp/
+ip_bans.yaml
+
+# Databases and logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.log.*
+home-assistant.log*
+home-assistant_v2.db*
+OZW_Log.txt
+guardian_data_log.jsonl
+**/guardian_data_log.jsonl
+
+# --- Guardian runtime artifacts ---
+# Camera snapshots written by script.guardian_sample_ambient_light. These live
+# in /config/guardian, NOT /config/www - the www tree is served as /local with
+# no authentication. The www/guardian/ globs are kept so an old install that
+# still has snapshots there cannot commit them.
+guardian/*.jpg
+guardian/*.jpeg
+guardian/*.png
+www/guardian/*.jpg
+www/guardian/*.jpeg
+www/guardian/*.png
+# Lamp auto-calibrate host files (written on the HA box, not in git)
+guardian/luma-run.env
+guardian/luma-samples.jsonl
+guardian/luma-profile.json
+guardian/luma-cal.txt
+guardian/*.tmp
+
+# --- ESPHome build output ---
+esphome/.esphome/
+esphome/build/
+esphome/.pioenvs/
+esphome/.piolibdeps/
+.esphome/
+
+# --- Frigate ---
+# The real config, which carries the camera RTSP password and the MQTT broker
+# credentials. Only frigate/config.yml.example is tracked.
+#
+# This file used to BE tracked, and INSTALL.md told the reader to add it here
+# themselves before typing credentials into it - a footgun that fires once and
+# is then permanent, since the only way back out is rewriting git history.
+# Ignoring it up front removes the class rather than warning about the instance.
+frigate/config.yml
+
+# --- Frigate runtime ---
+frigate/media/
+frigate/clips/
+frigate/recordings/
+frigate/*.db
+
+# --- Python bytecode from tools/ ---
+# guardian-preflight.py imports cleanly, but anything that imports IT (the
+# fault-injection checks, an editor's test runner) leaves this behind.
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Word exports of the assembly markdown. The installer path is
+# docs/documentation/*.md; do not commit a .docx next to it.
+*.docx
+
+# KiCad autosave / cache. Gerber zips under PCBs/ are published artifacts —
+# do not ignore those.
+**/fp-info-cache
+**/*-backups/
+*.kicad_prl
+*.kicad_sch-bak
+*.kicad_pcb-bak
+*.lck
+\#auto_saved_files#
+
+# --- Editor / OS noise ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local launch notes — never publish
+_launch_plan_extract.md
+*_launch_plan*.md
+
+# Editor / agent local state
+.cursor/
+.claude/
+
+# Source photography of one install. Assembly photos a builder needs live in
+# docs/documentation/. This folder stays on disk locally and is not published.
+docs/reference-images/
+
+# Historical Home Assistant editor screenshot. Can show helper hashes.
+screenshots/
+
+# ESPHome regenerates this on every build; the rules above already cover it.
+esphome/.gitignore

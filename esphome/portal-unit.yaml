@@ -1,0 +1,2907 @@
+# Local component: esphome/components/guardian_rfid. Path is relative to this
+# file. Stock rc522_i2c cannot authenticate NTAG user memory — it drops the
+# field before on_tag — so both readers use this instead of rc522_i2c.
+external_components:
+  - source:
+      type: local
+      path: components
+
+esphome:
+  name: portal-unit
+  friendly_name: Guardian Interior Portal
+  platformio_options:
+    board_build.flash_mode: qio
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(current_pin).clear();
+          id(imu_ready) = false;
+          id(rest_settle_ms) = 0;
+          id(prev_valid) = false;
+          id(lever_onset_ms) = 0;
+          id(lever_last_active_ms) = 0;
+          // Template binary sensors read "unknown" until first published, which
+          // would leave the F-21 corroboration check with nothing to read.
+          id(handle_depressed).publish_state(false);
+          id(door_moving).publish_state(false);
+      # DFPlayer powers up at an undocumented volume. A burglar alarm that
+      # plays at "whatever the module last remembered" is not an alarm. 30 is
+      # the module maximum; the housing and the speaker are the attenuator, not
+      # this number. Delay: the UART is not ready at reset.
+      - delay: 2s
+      - dfplayer.set_volume:
+          volume: 30
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    version: recommended
+    # FLASH ENCRYPTION AND SECURE BOOT ARE OFF ON PURPOSE.
+    #
+    # guardian_rfid_mac_key compiles into this firmware in cleartext. Enabling
+    # flash encryption (or secure boot) burns eFuses and is irreversible. The
+    # first encrypted image MUST go over USB; flashing these options over OTA
+    # onto a device that has never been provisioned bricks it. This board also
+    # uses QIO flash (board_build.flash_mode above); encrypted flash needs DIO
+    # first. See INSTALL.md § Flash encryption. Do not uncomment this and
+    # hope. Development mode is the only setting that still allows a USB
+    # reflash after the eFuse burn; release mode is a one-way door.
+    #
+    # sdkconfig_options:
+    #   CONFIG_SECURE_FLASH_ENC_ENABLED: y
+    #   CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT: y
+    # Secure boot is a separate one-way eFuse. Do not enable it until
+    # development-mode flash encryption has been proven on THIS board over
+    # USB, then OTA.
+    #   CONFIG_SECURE_BOOT: y
+    #   CONFIG_SECURE_BOOT_V2_ENABLED: y
+    
+psram:
+  mode: octal
+  speed: 80MHz 
+  
+globals:
+  - id: current_pin
+    type: std::string
+    initial_value: '""'
+  - id: last_key_time
+    type: uint32_t
+    initial_value: "0"
+  # Scratch for the keypad handler. on_key is a list of actions rather than one
+  # lambda, so the branch decision and the payload have to survive from the
+  # opening lambda into the homeassistant.event actions that follow it.
+  - id: kp_enroll
+    type: bool
+    initial_value: "false"
+  - id: kp_pin_change
+    type: bool
+    initial_value: "false"
+  - id: kp_event
+    type: std::string
+    initial_value: '""'
+
+  # ---------------------------------------------------------------------------
+  # IMU / door dynamics.
+  #
+  # The MPU6050 rides on the door LEVER, which rides on the door LEAF, so it
+  # sees exactly two rigid-body rotations and they are orthogonal:
+  #
+  #   lever press -> rotation about the spindle (horizontal, normal to the door
+  #                  face). This ROTATES the measured gravity vector.
+  #   door swing  -> rotation about the hinge (vertical, i.e. parallel to
+  #                  gravity). This leaves the measured gravity vector UNCHANGED.
+  #
+  # So decomposing against measured gravity separates them exactly:
+  #   theta_lever = angle(g_now, g_rest)   -- a door swing cannot produce this
+  #   omega_swing = w . g_now_unit         -- a lever press cannot produce this
+  #
+  # Because the reference is gravity itself and not a fixed axis, the mounting
+  # angle of the housing on the handle never appears as a constant anywhere.
+  # Nothing here needs calibrating by hand, and re-mounting the sensor (or
+  # fitting it to a different door) requires no config change.
+  #
+  # The previous implementation collapsed all six axes into two L2 magnitudes
+  # before deciding anything, which destroyed every trace of direction and made
+  # the sensor a generic vibration detector - audit F-18.
+  # ---------------------------------------------------------------------------
+  - id: imu_ready
+    type: bool
+    initial_value: "false"
+  - id: rest_settle_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: imu_last_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: imu_last_ax
+    type: float
+    initial_value: "0.0"
+  # Previous raw sample, used only by the startup stillness test. That test has
+  # to work BEFORE the gyro bias is known, so it compares consecutive samples
+  # rather than absolute magnitudes.
+  - id: prev_ax
+    type: float
+    initial_value: "0.0"
+  - id: prev_ay
+    type: float
+    initial_value: "0.0"
+  - id: prev_az
+    type: float
+    initial_value: "0.0"
+  - id: prev_gx
+    type: float
+    initial_value: "0.0"
+  - id: prev_gy
+    type: float
+    initial_value: "0.0"
+  - id: prev_gz
+    type: float
+    initial_value: "0.0"
+  - id: prev_valid
+    type: bool
+    initial_value: "false"
+  - id: loop_last_ms
+    type: uint32_t
+    initial_value: "0"
+  # Fast gravity estimate (tau ~120 ms) - rejects the linear-acceleration
+  # transients (slams, tangential swing accel) that dominated the old accel_delta.
+  - id: g_now_x
+    type: float
+    initial_value: "0.0"
+  - id: g_now_y
+    type: float
+    initial_value: "0.0"
+  - id: g_now_z
+    type: float
+    initial_value: "0.0"
+  # Rest reference (tau ~30 s), adapted only while genuinely still and shut.
+  - id: g_rest_x
+    type: float
+    initial_value: "0.0"
+  - id: g_rest_y
+    type: float
+    initial_value: "0.0"
+  - id: g_rest_z
+    type: float
+    initial_value: "0.0"
+  # Gyro zero-rate bias. Without this the swing integrator drifts badly - the
+  # MPU6050 is typically 1-5 deg/s off zero straight out of the box.
+  - id: bias_gx
+    type: float
+    initial_value: "0.0"
+  - id: bias_gy
+    type: float
+    initial_value: "0.0"
+  - id: bias_gz
+    type: float
+    initial_value: "0.0"
+  # Derived signals
+  - id: lever_deg
+    type: float
+    initial_value: "0.0"
+  - id: swing_dps
+    type: float
+    initial_value: "0.0"
+  - id: swing_angle
+    type: float
+    initial_value: "0.0"
+  - id: vibration
+    type: float
+    initial_value: "0.0"
+  # Lever press episode
+  - id: lever_press_start_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: lever_onset_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: lever_last_active_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: lever_peak_deg
+    type: float
+    initial_value: "0.0"
+  - id: lever_active_since_open
+    type: bool
+    initial_value: "false"
+  # Swing episode
+  - id: last_swing_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: swing_peak_dps
+    type: float
+    initial_value: "0.0"
+  - id: vib_peak
+    type: float
+    initial_value: "0.0"
+  - id: door_open_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: open_max_angle
+    type: float
+    initial_value: "0.0"
+  - id: last_dwell_ms
+    type: uint32_t
+    initial_value: "0"
+  # Snapshot of the evidence at the reed edge. Computed once in a single lambda
+  # so every field of the outgoing event describes the same instant; the event
+  # data lambdas below just read these back.
+  - id: ev_verdict
+    type: std::string
+    initial_value: '"unknown"'
+  - id: ev_conf
+    type: int
+    initial_value: "0"
+  - id: ev_lever_peak
+    type: float
+    initial_value: "0.0"
+  - id: ev_lever_at_open
+    type: float
+    initial_value: "0.0"
+  - id: ev_lever_onset_before
+    type: int
+    initial_value: "-1"
+  - id: ev_lever_held
+    type: bool
+    initial_value: "false"
+  - id: ev_swing_confirmed
+    type: bool
+    initial_value: "false"
+  - id: ev_swing_peak
+    type: float
+    initial_value: "0.0"
+  - id: ev_vib_peak
+    type: float
+    initial_value: "0.0"
+  - id: ev_close_verdict
+    type: std::string
+    initial_value: '"unknown"'
+  - id: ev_close_conf
+    type: int
+    initial_value: "0"
+  # Tamper. The IMU rides on the lever, so a case-movement threshold is the
+  # wrong predicate - it would fire on every normal opening. The two cheap
+  # predicates that already fall out of the swing integrator:
+  #
+  #   magnet_defeat   - the leaf rotated while the reed still reads closed
+  #   spoofed_contact - the reed opened but the leaf never rotated
+  #
+  # Both are gated on imu_healthy. A dead or latched gyro would otherwise
+  # treat every real outside opening as a spoofed reed. Debounced so a slam
+  # is not a tamper; cooldown so one event does not repeat.
+  - id: tamper_reason
+    type: std::string
+    initial_value: '""'
+  - id: tamper_last_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: tamper_magnet_start_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: door_closed_ms
+    type: uint32_t
+    initial_value: "0"
+  # How many API clients are currently connected. The native API allows more
+  # than one (Home Assistant, plus the ESPHome dashboard/log viewer whenever
+  # someone opens it) and on_client_connected/on_client_disconnected fire
+  # per-connection, so this exists to stop the status LED going red when a
+  # second client closes while Home Assistant is still there.
+  #
+  # It used to back an api_connected bool that the display read as its link
+  # state. It no longer does: a count is only correct while every disconnect
+  # fires its handler, and a socket that dies without one leaves the count
+  # permanently above zero - i.e. permanently claiming CONNECTED, which is the
+  # dangerous direction to be wrong in. The display now reads the status
+  # binary_sensor, which is ESPHome's own view. This count only drives an LED,
+  # where being wrong is cosmetic.
+  - id: api_client_count
+    type: int
+    initial_value: "0"
+  - id: wifi_connected
+    type: bool
+    initial_value: "false"
+
+  # ---------------------------------------------------------------------------
+  # OFFLINE SIREN - THE PORTAL'S ONLY INDEPENDENT AUTHORITY.
+  #
+  # UNBUILT AND UNHEARD. Written on a machine with no ESP32 attached and no
+  # speaker. It has never been compiled, never been flashed, and no part of it
+  # has made a sound. Treat every claim below as a design, not a result, until
+  # DEPLOY.md steps 275-281 have actually been run.
+  #
+  # The gap this closes: until now the siren existed only as
+  # `dfplayer.play_mp3: file: 4` behind a template button, pressed by a Home
+  # Assistant automation over the network. Cutting power to the access point,
+  # jamming 2.4 GHz, or stopping Home Assistant silenced the entire system, and
+  # the attacker learned nothing about whether it had worked, because nothing
+  # announced it. ESPHome DROPS homeassistant.event with no client connected
+  # rather than queuing it, so the door produced no siren, no chirp, and no
+  # record - not even a late one.
+  #
+  # WHY THE AUTHORITY LIVES IN RAM AND DIES ON A REBOOT.
+  #
+  # The specification said to keep the last-known value of ha_elevated_mode and
+  # bound its staleness. Bounding staleness needs a clock that survives, and
+  # this device does not have one: there is no RTC, millis() restarts at zero,
+  # and an ESP32 cannot tell a fifteen-minute reboot from an eight-hour power
+  # cut. Persisting the flag to flash without a trustworthy elapsed time would
+  # mean waking up after an unknown interval still believing the house was
+  # armed - which is precisely the 3am-on-day-two failure the constraint warns
+  # about, arrived at from the other direction.
+  #
+  # So authority is RAM-only and millis()-bounded, which is exact for as long as
+  # the device stays up, and a reboot simply revokes it. That makes a reboot
+  # fail SAFE - it can only ever silence, never start - and it is why the
+  # reboot_timeouts had to change: see the api: block. The honest limitation,
+  # stated in DEPLOY.md and INSTALL.md rather than buried here, is that cutting
+  # power to the portal itself ends offline protection until Home Assistant
+  # returns.
+  # ---------------------------------------------------------------------------
+  # Last-known ha_elevated_mode, and the millis() at which it was last confirmed
+  # by a live Home Assistant. Both are meaningless without the other.
+  - id: offline_auth
+    type: bool
+    initial_value: "false"
+  - id: offline_auth_ms
+    type: uint32_t
+    initial_value: "0"
+  # The local siren, once it is running.
+  - id: offline_siren_on
+    type: bool
+    initial_value: "false"
+  - id: offline_siren_start_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: offline_siren_last_ms
+    type: uint32_t
+    initial_value: "0"
+  # An unconditional local silence has been used. Latched so that the same door
+  # standing open cannot immediately re-trigger the siren on the person who just
+  # silenced it - cleared when the door closes or Home Assistant returns.
+  - id: offline_silenced
+    type: bool
+    initial_value: "false"
+  # THE RECORD. A siren nobody can prove sounded is the same evidence as a siren
+  # that did not, so what happened while the portal was alone is counted here
+  # and handed over on reconnect. restore_value on purpose: this is the one
+  # thing that MUST survive the reboot that revokes the authority above, or a
+  # power cut erases the evidence of the event it is evidence of.
+  - id: offline_siren_events
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: offline_siren_seconds
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: offline_stop_reason
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # ---------------------------------------------------------------------------
+  # Display state. ui_last_activity_ms is bumped by anything a person did or
+  # anything they would want to look at, and it drives both the idle page
+  # rotation and the night dimming.
+  # ---------------------------------------------------------------------------
+  - id: ui_last_activity_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: ui_page
+    type: int
+    initial_value: "0"
+  - id: ui_page_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: ui_prev_state
+    type: std::string
+    initial_value: '""'
+  # Last seen value of input_number.portal_display_seq. The string above cannot
+  # detect a repeated verdict, because Home Assistant emits no state change when
+  # a helper is written the value it already holds; the counter always moves.
+  - id: ui_prev_seq
+    type: int
+    initial_value: "-1"
+  # millis() of the last verdict, used to flash a short accent bar. Without it a
+  # verdict that REPEATS the one already on screen is indistinguishable from the
+  # previous one still being displayed - which is precisely the complaint that
+  # started all this: "I scan the card I just enrolled and the screen does
+  # nothing." Holding the screen for the full three seconds is the correctness
+  # fix; this is what makes the repeat legible to a person.
+  - id: ui_seq_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: ui_backlight
+    type: float
+    initial_value: "1.0"
+  # Set for the duration of an enrollment payload write so HOLD CARD appears
+  # while the tag is still on the coil, not only after Home Assistant sees
+  # write_fail. Cleared on scan result and on tag removed.
+  - id: ui_writing
+    type: bool
+    initial_value: "false"
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    
+# A bare "logger:" is DEBUG, and every line is also pushed to each connected
+# API client. This device runs a 20ms physics lambda and a 200ms display
+# refresh, so DEBUG is a continuous stream of traffic over the same connection
+# the door events depend on. INFO keeps startup and warnings without the noise;
+# raise it temporarily when actually debugging.
+logger:
+  level: INFO
+  # ESPHome will not let a per-tag "logs:" entry be MORE verbose than this
+  # global level, so the guardian_rfid REQA/SELECT trace lines (DEBUG) are
+  # invisible at INFO. To see them, temporarily change level above to DEBUG,
+  # reflash, capture the tap, then set it back to INFO before normal use.
+
+ota:
+  - platform: esphome
+    password: !secret portal_unit__ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # use_address is where Home Assistant looks for this node (mDNS is unreliable
+  # on some APs). The address itself is a reservation or static IP on the LAN;
+  # keep it in secrets.yaml so this file is not house-specific.
+  use_address: !secret portal_unit__ip
+  manual_ip:
+    static_ip: !secret portal_unit__ip
+    gateway: !secret portal_unit__gateway
+    subnet: !secret portal_unit__subnet
+    # With manual_ip set and no dns1, this device has no resolver at all. Not
+    # currently fatal - the clock comes from the Home Assistant API and Home
+    # Assistant initiates the connection - but it is a trap waiting for the
+    # first component that needs a hostname, and it costs one line.
+    dns1: !secret portal_unit__dns
+  # The ESP32 default is LIGHT, which sleeps the modem between DTIM beacons.
+  # It saves power this device does not need to save (it is mains powered and
+  # driving a backlit display) and it is the most common reason an ESPHome node
+  # flaps to unavailable, because some access points age out a sleeping client.
+  # The doorbell has always set this; the portal was simply missed.
+  power_save_mode: none
+  # DISABLED, and replaced by the conditional watchdog in the interval: block
+  # below. This is not a preference; the offline siren does not work without it.
+  #
+  # The old comment here said this was "explicit rather than relying on the
+  # 15min default, so it reads at a glance next to the API timeout below" - and
+  # the API timeout below was never actually set, so it read at a glance next to
+  # nothing and the api: block silently took ESPHome's own 15-minute default.
+  # Two reboot timers, one documented, neither examined.
+  #
+  # What they did: fifteen minutes into any outage, both fired. The portal
+  # rebooted, and kept rebooting every fifteen minutes for as long as Home
+  # Assistant was away. That is harmless when the portal has no authority of its
+  # own. It is fatal to an offline siren, because a reboot wipes the RAM the
+  # authority lives in - so the feature would have died fifteen minutes into
+  # exactly the outage it exists for, and a burglar who waited would have walked
+  # into a silent house. An attacker who cuts the access point does not need to
+  # defeat the siren; they need to outlast a quarter of an hour.
+  #
+  # A blanket reboot_timeout: 0s would trade that for a node that never
+  # self-heals from a wedged network stack. The watchdog below keeps the
+  # self-heal and skips it only while this device is holding authority or
+  # actually sounding - the two states where rebooting is the wrong answer.
+  reboot_timeout: 0s
+  ap:
+    ssid: !secret portal_unit__ap_ssid
+    password: !secret portal_unit__ap_password
+  on_connect:
+    then:
+      - lambda: "id(wifi_connected) = true;"
+      - light.turn_on:
+          id: portal_led
+          red: 0%
+          green: 100%
+          blue: 0%
+          brightness: 100%
+          effect: none
+      - delay: 3s
+      - light.turn_off: portal_led
+  on_disconnect:
+    then:
+      - lambda: "id(wifi_connected) = false;"
+      - light.turn_on:
+          id: portal_led
+          red: 100%
+          green: 0%
+          blue: 0%
+          brightness: 100%
+          effect: none
+api:
+  encryption:
+    key: !secret portal_unit__encryption_key
+  # Written out, and set to 0s, for the reasons in the wifi: block above. This
+  # value was never stated here before and quietly took the 15-minute default,
+  # while the comment on wifi: reboot_timeout claimed it could be read "at a
+  # glance next to the API timeout below". A default nobody wrote down is not a
+  # decision, and this one would have switched the offline siren off a quarter
+  # of an hour into every outage.
+  reboot_timeout: 0s
+  on_client_connected:
+    then:
+      - lambda: 'id(api_client_count)++;'
+      - light.turn_on:
+          id: portal_led
+          red: 0%
+          green: 100%
+          blue: 0%
+          brightness: 100%
+          effect: none
+      - delay: 3s
+      - light.turn_off:
+          id: portal_led
+      # HAND OVER WHAT HAPPENED WHILE WE WERE ALONE. UNBUILT AND UNHEARD.
+      #
+      # Without this the whole offline siren is unfalsifiable: a siren nobody
+      # can prove sounded is the same evidence as a siren that did not, and the
+      # household would have no way to tell "it worked" from "it never fired"
+      # from "it is not built into this flash". The counters are restore_value,
+      # so they survive the reboot that revokes the authority - the event is
+      # more likely to be delayed by a reboot than lost to one.
+      #
+      # Sent after the 3s settle above, because an event fired the instant the
+      # socket opens can land before Home Assistant has finished subscribing and
+      # would be dropped exactly like the events this feature exists to replace.
+      #
+      # Only when there is something to say. A zero report every reconnect would
+      # be noise, and noise is what stops people reading reports.
+      - if:
+          condition:
+            lambda: 'return id(offline_siren_events) > 0;'
+          then:
+            - homeassistant.event:
+                event: esphome.offline_siren_report
+                data:
+                  source: interior_portal
+                  events: !lambda "return to_string(id(offline_siren_events));"
+                  seconds: !lambda "return to_string(id(offline_siren_seconds));"
+                  # 0 still running or unknown, 1 valid card, 2 local silence,
+                  # 3 duration cap, 4 Home Assistant returned.
+                  last_stop_reason: !lambda "return to_string(id(offline_stop_reason));"
+            - lambda: |-
+                ESP_LOGW("guardian",
+                         "Reported %d offline siren event(s), %d s total, last stop reason %d",
+                         id(offline_siren_events), id(offline_siren_seconds),
+                         id(offline_stop_reason));
+                id(offline_siren_events) = 0;
+                id(offline_siren_seconds) = 0;
+                id(offline_stop_reason) = 0;
+  on_client_disconnected:
+    then:
+      - lambda: |-
+          if (id(api_client_count) > 0) id(api_client_count)--;
+      # Only go red once the LAST client has gone. Closing the ESPHome
+      # dashboard's log viewer disconnects a client while Home Assistant is
+      # still connected, and this used to light the LED red and leave it red -
+      # nothing re-fires on_client_connected for a connection that never
+      # dropped, so there was no path back to green.
+      - if:
+          condition:
+            lambda: 'return id(api_client_count) <= 0;'
+          then:
+            - light.turn_on:
+                id: portal_led
+                red: 100%
+                green: 0%
+                blue: 0%
+                brightness: 100%
+                effect: none
+          
+captive_portal:
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  # 400 kHz (both the MPU6050 and the RC522 support it). Needed headroom for the
+  # 50 Hz IMU poll alongside the 500 ms RFID poll on the same bus.
+  frequency: 400000hz
+  
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  
+uart:
+  id: uart_dfplayer
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  baud_rate: 9600
+  
+# Replaces rc522_i2c. HMAC verify / rotate / enroll run while the card is still
+# selected; the event carries card_id + counter, never the factory UID. Keep
+# the I/O short: this bus is shared with the 50 Hz IMU.
+guardian_rfid:
+  id: guardian_reader
+  address: 0x28
+  update_interval: 500ms
+  source: interior_portal
+  master_key: !secret guardian_rfid_mac_key
+  enrollment: ha_enrollment_mode
+  on_write_begin:
+    then:
+      - lambda: |-
+          id(ui_last_activity_ms) = millis();
+          if (id(ha_enrollment_mode).state)
+            id(ui_writing) = true;
+      - if:
+          condition:
+            lambda: 'return id(ui_writing);'
+          then:
+            - component.update: portal_tft
+  on_scan:
+    then:
+      # INFO on purpose: ESPHome's own tag log is DEBUG, and this device runs
+      # at INFO. If this line appears the reader finished a transaction; if it
+      # does not, the tag was never processed. UID is not printed (F-20).
+      - lambda: |-
+          id(ui_writing) = false;
+          ESP_LOGI("guardian",
+                   "RFID scan (interior portal): result=%s card_id=%s counter=%u rotated=%s",
+                   id(guardian_reader).result().c_str(),
+                   id(guardian_reader).card_id_hex().c_str(),
+                   (unsigned) id(guardian_reader).counter(),
+                   id(guardian_reader).rotated() ? "true" : "false");
+          id(ui_last_activity_ms) = millis();
+
+          // OFFLINE SIREN, STOP 1 OF 2: a genuine card at this reader.
+          // UNBUILT AND UNHEARD.
+          //
+          // "ok" means the payload verified against a MAC only the master key
+          // can produce, computed locally - no Home Assistant involved, which
+          // is the point: during an outage this is the only proof of identity
+          // the building has. A resident coming home to a siren they triggered
+          // themselves taps their key and it stops.
+          //
+          // Stolen and lost cards are a Home Assistant concept and it is not
+          // answering, so any valid card silences this. That is the deliberate
+          // trade: the alternative is a resident who cannot stop their own
+          // alarm, and a siren nobody can stop is the reason people remove
+          // fuses. Stop 2 needs no card at all for the same reason.
+          if (id(offline_siren_on) && id(guardian_reader).result() == "ok") {
+            id(offline_siren_on) = false;
+            id(offline_silenced) = true;
+            id(offline_stop_reason) = 1;  // 1 = valid card
+            id(offline_siren_seconds) +=
+                (int) ((uint32_t)(millis() - id(offline_siren_start_ms)) / 1000);
+            ESP_LOGI("guardian", "Offline siren stopped: valid card at the portal reader");
+          }
+      - homeassistant.event:
+          event: esphome.rfid_scanned
+          data:
+            source: interior_portal
+            result: !lambda "return id(guardian_reader).result();"
+            card_id: !lambda "return id(guardian_reader).card_id_hex();"
+            counter: !lambda "return std::to_string(id(guardian_reader).counter());"
+            rotated: !lambda "return std::string(id(guardian_reader).rotated() ? \"true\" : \"false\");"
+            uid_bytes: !lambda "return std::to_string(id(guardian_reader).uid_bytes());"
+            # See the note on the same field in doorbell-unit.yaml: "false"
+            # means this card's payload can be read by any reader, and a
+            # readable bearer token is a clonable card.
+            protected: !lambda "return std::string(id(guardian_reader).tag_protected() ? \"true\" : \"false\");"
+  on_tag_removed:
+    then:
+      - lambda: "id(ui_writing) = false;"
+      - logger.log:
+          level: INFO
+          format: "RFID tag removed (interior portal)"
+sensor:
+  - platform: mpu6050
+    address: 0x68
+    # 50 Hz. A lever press has a 150-400 ms leading edge; at the old 20 Hz its
+    # onset could not be resolved against a 50 ms-debounced reed edge.
+    update_interval: 20ms
+    accel_x:
+      id: accel_x
+      internal: true
+    accel_y:
+      id: accel_y
+      internal: true
+    accel_z:
+      id: accel_z
+      internal: true
+    gyro_x:
+      id: gyro_x
+      internal: true
+    gyro_y:
+      id: gyro_y
+      internal: true
+    gyro_z:
+      id: gyro_z
+      internal: true
+
+  # Derived door physics. These are the signals to chart when tuning the
+  # thresholds below - open the door each way a few times and read them back.
+  #
+  # All four sampled at 500ms with no filters, which is eight state messages per
+  # second, forever, over the same API connection the door events use - and
+  # every one of them recorded. Nothing consumes these live: the classification
+  # runs on-device in the 20ms lambda against the raw globals, and these entities
+  # exist purely so a human can chart them while tuning.
+  #
+  # delta_or_heartbeat keeps the resolution that matters (a change worth seeing
+  # is published immediately) while an idle door - which is almost all the time,
+  # and where every reading is identical - publishes once a minute instead of
+  # 120 times. The interval stays at 500ms so a real movement is still caught
+  # within half a second.
+  - platform: template
+    name: "Handle Tilt"
+    id: handle_tilt
+    icon: mdi:angle-acute
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    update_interval: 500ms
+    lambda: "return id(lever_deg);"
+    filters:
+      - or:
+        - delta: 0.5
+        - heartbeat: 60s
+  - platform: template
+    name: "Door Swing Rate"
+    id: door_swing_rate
+    icon: mdi:rotate-right
+    unit_of_measurement: "°/s"
+    accuracy_decimals: 1
+    update_interval: 500ms
+    lambda: "return id(swing_dps);"
+    filters:
+      - or:
+        - delta: 0.5
+        - heartbeat: 60s
+  - platform: template
+    name: "Door Swing Angle"
+    id: door_swing_angle
+    icon: mdi:door-open
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    update_interval: 500ms
+    lambda: "return fabsf(id(swing_angle));"
+    filters:
+      - or:
+        - delta: 0.5
+        - heartbeat: 60s
+  - platform: template
+    name: "Door Vibration"
+    id: door_vibration
+    icon: mdi:vibrate
+    unit_of_measurement: "m/s²"
+    accuracy_decimals: 2
+    update_interval: 500ms
+    lambda: "return id(vibration);"
+    filters:
+      - or:
+        - delta: 0.05
+        - heartbeat: 60s
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_rssi
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    name: "Uptime"
+    id: portal_uptime
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: homeassistant
+    id: ha_mfa_fails
+    entity_id: input_number.mfa_failed_attempts
+    internal: true
+  # Full length of the active Guardian window, in seconds - scales the countdown
+  # bar so a 40 s MFA window and a 20 s entry window both read correctly. The
+  # deadline itself is imported as a text_sensor further down; see the note
+  # there for why it cannot be a number.
+  - platform: homeassistant
+    id: ha_countdown_total
+    entity_id: sensor.guardian_portal_countdown_total
+    internal: true
+  # Bumped by script.guardian_set_display on every verdict write, including one
+  # that repeats the value already showing.
+  #
+  # The display used to wake the backlight and reset the idle rotation on
+  # "portal_display_state changed". Home Assistant emits no state change when a
+  # helper is written the value it already holds, so a second identical verdict
+  # was invisible here - present a card, get GRANTED, present it again inside the
+  # three-second window and the screen did nothing at all. This is the signal
+  # that always moves.
+  - platform: homeassistant
+    id: ha_display_seq
+    entity_id: input_number.portal_display_seq
+    internal: true
+  # How many card slots hold no valid hash. Drives the enrollment
+  # screen's choice between "present a card" and "pick a slot to replace".
+  - platform: homeassistant
+    id: ha_free_slots
+    entity_id: sensor.guardian_rfid_free_slots
+    internal: true
+
+number:
+  # Minimum sustained lever rotation that counts as "the latch was retracted by
+  # the handle". The exterior of this door is a fixed plate with a euro
+  # cylinder, so the inside lever cannot move during an entry from outside -
+  # which makes a genuine lever rotation proof of an opening from inside.
+  - platform: template
+    name: "Handle Tilt Threshold"
+    id: handle_tilt_threshold
+    icon: mdi:angle-acute
+    unit_of_measurement: "°"
+    min_value: 3
+    max_value: 45
+    step: 1
+    initial_value: 12
+    restore_value: true
+    optimistic: true
+  - platform: template
+    name: "Swing Rate Threshold"
+    id: swing_rate_threshold
+    icon: mdi:rotate-right
+    unit_of_measurement: "°/s"
+    min_value: 2
+    max_value: 40
+    step: 1
+    initial_value: 8
+    restore_value: true
+    optimistic: true
+  # How far back before the reed edge a lever press still counts as the cause of
+  # the opening. Single source of truth: the old build compared a 4000 ms window
+  # on-device against a 2000 ms window in automations.yaml.
+  - platform: template
+    name: "Handle Lookback"
+    id: handle_lookback
+    icon: mdi:history
+    unit_of_measurement: "ms"
+    min_value: 500
+    max_value: 6000
+    step: 100
+    initial_value: 2500
+    restore_value: true
+    optimistic: true
+
+  # A number entity and NOT a compiled constant, deliberately. This is the
+  # figure that decides whether a household's front door screams at 3am on the
+  # second day of a power cut, and the person it happens to must be able to see
+  # what it is set to and change it without a toolchain. A constant buried in
+  # firmware is a decision made on their behalf that they cannot inspect.
+  #
+  # How long the portal keeps believing "the house was in elevated mode" after
+  # Home Assistant stops answering. Beyond this it will not sound on its own,
+  # because a stale belief about the alarm state is a false alarm waiting for a
+  # trigger. Counted from the last confirmation by a LIVE Home Assistant, and
+  # revoked outright by a reboot.
+  - platform: template
+    name: "Offline Authority Hours"
+    id: offline_authority_hours
+    icon: mdi:clock-alert-outline
+    unit_of_measurement: "h"
+    min_value: 1
+    max_value: 24
+    step: 1
+    initial_value: 4
+    restore_value: true
+    optimistic: true
+
+  # The hard cap. Whatever else happens - nobody home, no card, nobody who knows
+  # about the local silence - the noise stops after this. The worst case is
+  # minutes of siren and not a day of it, which is the difference between a
+  # neighbour calling the police and a neighbour pulling the fuse. Also a legal
+  # limit in many places, which is worth knowing before publishing this.
+  #
+  # Applies to the OFFLINE siren. The online loop in automations.yaml gets the
+  # same treatment in the same pass - it had no cap at all, and nobody had
+  # noticed, because the constraint was written for the feature that did not
+  # exist yet rather than the one that did.
+  - platform: template
+    name: "Offline Siren Max Minutes"
+    id: offline_siren_max_minutes
+    icon: mdi:timer-alert-outline
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 15
+    step: 1
+    initial_value: 5
+    restore_value: true
+    optimistic: true
+
+binary_sensor:
+  # The authoritative link state, from ESPHome itself rather than from a counter
+  # this file maintains by hand.
+  #
+  # Two things use it. Home Assistant gets binary_sensor.<device>_status, which
+  # replaces "infer the portal is offline because its door contact went
+  # unavailable" in the offline watchdog. The display lambda reads it directly
+  # for the green/red dot and the NO LINK screen, retiring api_client_count as
+  # the source of truth: a reference count can only be correct if every
+  # disconnect fires its handler, and a socket that dies without one leaves the
+  # count stuck above zero - i.e. stuck reporting CONNECTED off stale cached
+  # values. That is a strictly worse failure than the flicker the counter was
+  # introduced to fix. The counter still drives the status LED, where being
+  # wrong is cosmetic.
+  - platform: status
+    name: "Status"
+    id: api_status
+  - platform: homeassistant
+    id: ha_super_surveillance
+    entity_id: input_boolean.super_surveillance_mode
+    internal: true
+  - platform: homeassistant
+    id: ha_elevated_mode
+    entity_id: binary_sensor.guardian_elevated_mode
+    internal: true
+  - platform: homeassistant
+    id: ha_enrollment_mode
+    entity_id: input_boolean.guardian_enrollment_mode
+    internal: true
+  - platform: homeassistant
+    id: ha_pin_change_mode
+    entity_id: input_boolean.guardian_pin_change_mode
+    internal: true
+  # Session flag: the next enrolled card (or a tap of an already-registered
+  # card) is a visitor key. Toggled by 0 on the keypad during enrollment.
+  - platform: homeassistant
+    id: ha_enroll_as_visitor
+    entity_id: input_boolean.guardian_enroll_as_visitor
+    internal: true
+  # Needed so the DENIED screen can tell a rejected PIN from a rejected card.
+  # portal_display_state alone cannot: it is a single untyped channel that both
+  # auth paths write to.
+  - platform: homeassistant
+    id: ha_mfa_pending
+    entity_id: input_boolean.portal_mfa_pending
+    internal: true
+  # An elevated-mode opening is being challenged. The keypad needs this as well
+  # as the display: a PIN typed during a challenge is a valid answer even though
+  # no MFA challenge is pending, so the buffer must keep accepting digits.
+  - platform: homeassistant
+    id: ha_entry_challenge
+    entity_id: input_boolean.guardian_entry_challenge
+    internal: true
+  # Doorbell reachability, for the DB indicator in the status strip. Derived
+  # Home Assistant side (packages/guardian.yaml) from the doorbell's own API
+  # status entity, so the portal renders a value rather than computing one.
+  - platform: homeassistant
+    id: ha_doorbell_online
+    entity_id: binary_sensor.guardian_doorbell_online
+    internal: true
+  # Replaces the old "Handle Motion", which fired on any vibration. This one
+  # only goes true for a sustained lever rotation. It reaches Home Assistant
+  # over the authenticated ESPHome state channel, so the direction classifier
+  # can corroborate the (forgeable) event payload against it - audit F-21.
+  - platform: template
+    name: "Handle Depressed"
+    id: handle_depressed
+    device_class: moving
+  - platform: template
+    name: "Door Moving"
+    id: door_moving
+    device_class: moving
+  - platform: template
+    name: "IMU Healthy"
+    id: imu_healthy
+    device_class: problem
+    entity_category: diagnostic
+    lambda: |-
+      // device_class problem: true means NOT healthy.
+      return !(id(imu_ready) && (uint32_t)(millis() - id(imu_last_ms)) < 500);
+  # Polarity, so this does not get inverted back by mistake:
+  #
+  #   door CLOSED -> the two magnet halves meet -> reed contact closes ->
+  #                  GPIO42 is pulled down to GND -> reads LOW -> state false
+  #   door OPEN   -> reed contact opens -> INPUT_PULLUP holds it HIGH ->
+  #                  state true
+  #
+  # device_class: door reports state true as "Open", which is exactly right, so
+  # NO `inverted:` belongs here. With it, the sensor read backwards: the system
+  # called the door open whenever it was shut.
+  #
+  # Everything downstream reads `id(door_contact).state == true` as open, and
+  # on_press/on_release below are the opening/closing edges respectively.
+  - platform: gpio
+    pin:
+      number: GPIO42
+      mode: INPUT_PULLUP
+    name: "Door Contact"
+    id: door_contact
+    device_class: door
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      # Snapshot the evidence once, so every field of the event below describes
+      # the same instant rather than each lambda re-reading a moving target.
+      - lambda: |-
+          const uint32_t now = millis();
+          const uint32_t lookback = (uint32_t) id(handle_lookback).state;
+
+          // Read the QUALIFIED lever state, not the raw angle. By the time the
+          // reed opens the leaf is already rotating, and the raw angle carries
+          // several degrees of swing-induced error at that moment.
+          const bool lever_held = id(handle_depressed).state;
+          const bool lever_recent = id(lever_onset_ms) != 0 &&
+                                    (uint32_t)(now - id(lever_last_active_ms)) <= lookback;
+          // The door leaf really rotated, as opposed to the reed simply
+          // changing state. Guards against a stuck or bumped contact.
+          const bool swung = fabsf(id(swing_angle)) >= 1.5f ||
+                             (id(last_swing_ms) != 0 &&
+                              (uint32_t)(now - id(last_swing_ms)) <= 1000);
+
+          id(ev_lever_peak) = id(lever_peak_deg);
+          id(ev_lever_at_open) = id(lever_deg);
+          id(ev_lever_held) = lever_held;
+          id(ev_swing_confirmed) = swung;
+          id(ev_swing_peak) = id(swing_peak_dps);
+          id(ev_vib_peak) = id(vib_peak);
+          id(ev_lever_onset_before) = id(lever_onset_ms) == 0
+                                        ? -1
+                                        : (int)(uint32_t)(now - id(lever_onset_ms));
+
+          if (lever_held || lever_recent) {
+            // Only the inside lever can retract this latch, so a real lever
+            // rotation is proof of an opening from inside.
+            id(ev_verdict) = "inside";
+            id(ev_conf) = lever_held ? 95 : 90;
+          } else if (swung) {
+            // A confirmed swing with the lever never leaving rest means the
+            // latch was retracted some other way - i.e. by key from outside.
+            // This is positive evidence, not a guess, which is why this build
+            // can assert "outside" where the old one could only say "unknown".
+            //
+            // It also fixes audit F-18: jimmying the door produces vibration
+            // but no sustained lever rotation, so it now lands here instead of
+            // being reported as a family member's exit.
+            id(ev_verdict) = "outside";
+            id(ev_conf) = 70;
+          } else {
+            id(ev_verdict) = "unknown";
+            id(ev_conf) = 0;
+          }
+
+          id(door_open_ms) = now;
+          id(open_max_angle) = fabsf(id(swing_angle));
+          id(lever_active_since_open) = false;
+          id(ui_last_activity_ms) = now;
+
+          // ---- OFFLINE SIREN TRIGGER. UNBUILT AND UNHEARD. -------------------
+          // The door opened. If Home Assistant is not answering, and the last
+          // thing it told us was that the house was in elevated mode, and that
+          // was recent enough to still be worth believing, then nothing else is
+          // going to make a noise about this - so this device does.
+          //
+          // The event below is dropped on the floor when no API client is
+          // connected. ESPHome does not queue it. So in this exact situation
+          // the alternative to acting locally is not "a late alert", it is
+          // silence and no record at all.
+          //
+          // Deliberately NOT gated on the inside/outside verdict. The verdict
+          // depends on the IMU, which has its own failure modes and reports
+          // "unknown" for the whole window after a reboot; an alarm that only
+          // fires when the physics agrees is an alarm with a second thing to
+          // defeat. In elevated mode any opening is one Home Assistant would
+          // have challenged.
+          if (!id(api_status).state && !id(offline_siren_on) && !id(offline_silenced)) {
+            const uint32_t auth_ms =
+                (uint32_t) (id(offline_authority_hours).state * 3600000.0f);
+            const bool auth_fresh = id(offline_auth) && id(offline_auth_ms) != 0 &&
+                                    (uint32_t)(now - id(offline_auth_ms)) <= auth_ms;
+            if (auth_fresh) {
+              id(offline_siren_on) = true;
+              id(offline_siren_start_ms) = now;
+              id(offline_siren_last_ms) = 0;
+              id(offline_siren_events) += 1;
+              id(offline_stop_reason) = 0;
+              ESP_LOGW("guardian",
+                       "OFFLINE ALARM: door opened with no Home Assistant and elevated mode "
+                       "last confirmed %u s ago. Sounding locally.",
+                       (unsigned) ((uint32_t)(now - id(offline_auth_ms)) / 1000));
+            }
+          }
+      - homeassistant.event:
+          event: esphome.door_opened
+          data:
+            source: reed_switch
+            verdict: !lambda "return id(ev_verdict);"
+            confidence: !lambda "return to_string(id(ev_conf));"
+            lever_peak_deg: !lambda "return str_sprintf(\"%.1f\", id(ev_lever_peak));"
+            lever_at_open_deg: !lambda "return str_sprintf(\"%.1f\", id(ev_lever_at_open));"
+            lever_onset_ms_before_open: !lambda "return to_string(id(ev_lever_onset_before));"
+            lever_held_at_open: !lambda "return id(ev_lever_held) ? \"true\" : \"false\";"
+            swing_confirmed: !lambda "return id(ev_swing_confirmed) ? \"true\" : \"false\";"
+            swing_peak_dps: !lambda "return str_sprintf(\"%.1f\", id(ev_swing_peak));"
+            vibration_peak: !lambda "return str_sprintf(\"%.2f\", id(ev_vib_peak));"
+            imu_healthy: !lambda |-
+              const bool ok = id(imu_ready) &&
+                              (uint32_t)(millis() - id(imu_last_ms)) < 500;
+              return ok ? "true" : "false";
+      # Spoofed contact: the reed opened but the leaf never rotated. Do not
+      # fire on the open edge - a slow outside open and a bumped reed both
+      # look like that for a moment. Wait, then re-check swing.
+      - script.execute: check_spoofed_reed
+    on_release:
+      - lambda: |-
+          const uint32_t now = millis();
+          id(ui_last_activity_ms) = now;
+          id(door_closed_ms) = now;
+          id(tamper_magnet_start_ms) = 0;
+          id(last_dwell_ms) = id(door_open_ms) == 0
+                                ? 0
+                                : (uint32_t)(now - id(door_open_ms));
+
+          // The door is shut again, so the silence that applied to THIS opening
+          // has done its job. Clearing it here is what makes the latch
+          // per-opening rather than per-outage: without it, one press of one key
+          // would disarm the offline siren for the rest of the outage, and an
+          // intruder who silenced the first opening would get silence for every
+          // one after it.
+          id(offline_silenced) = false;
+
+          // The exterior has no handle, so lever movement while the door stood
+          // open can only have come from someone on the inside. Its absence is
+          // much weaker evidence: a person indoors can also just push the door
+          // shut without touching the lever. Hence the asymmetric confidence.
+          if (id(lever_active_since_open)) {
+            id(ev_close_verdict) = "inside";
+            id(ev_close_conf) = 85;
+          } else if (id(open_max_angle) >= 5.0f) {
+            id(ev_close_verdict) = "outside";
+            id(ev_close_conf) = 55;
+          } else {
+            id(ev_close_verdict) = "unknown";
+            id(ev_close_conf) = 0;
+          }
+      - homeassistant.event:
+          event: esphome.door_closed
+          data:
+            source: reed_switch
+            dwell_ms: !lambda "return to_string(id(last_dwell_ms));"
+            closed_verdict: !lambda "return id(ev_close_verdict);"
+            confidence: !lambda "return to_string(id(ev_close_conf));"
+            max_open_angle_deg: !lambda "return str_sprintf(\"%.1f\", id(open_max_angle));"
+            close_swing_peak_dps: !lambda "return str_sprintf(\"%.1f\", id(swing_peak_dps));"
+      - delay: 2s
+      # Note what is deliberately NOT reset here: the gravity rest reference.
+      # The old build invalidated it 2 s after every close and re-seeded from a
+      # single instantaneous sample, so closing the door while still holding the
+      # lever baked the deflected position in as "rest" (audit F-22). The slow
+      # EMA in the detection loop maintains it instead, and only adapts while
+      # the lever is genuinely at rest.
+      - lambda: |-
+          // Guard against a close-then-reopen inside this 2 s delay: without it
+          // the pending reset lands in the middle of the NEXT opening and zeroes
+          // the swing reference while the leaf is moving.
+          if (id(door_contact).state) return;
+          id(door_open_ms) = 0;
+          id(swing_angle) = 0.0f;
+          id(swing_peak_dps) = 0.0f;
+          id(vib_peak) = 0.0f;
+          id(lever_active_since_open) = false;
+
+# Tamper emitters. Internal: they exist so the physics loop and the delayed
+# spoofed-reed check can fire one homeassistant.event without publishing a
+# fake HA sensor. The event is the source of truth.
+script:
+  - id: fire_tamper
+    mode: single
+    then:
+      - homeassistant.event:
+          event: esphome.tamper_alert
+          data:
+            reason: !lambda "return id(tamper_reason);"
+            swing_angle_deg: !lambda "return str_sprintf(\"%.1f\", id(swing_angle));"
+            swing_peak_dps: !lambda "return str_sprintf(\"%.1f\", id(swing_peak_dps));"
+            swing_confirmed: !lambda "return id(ev_swing_confirmed) ? \"true\" : \"false\";"
+            door_open: !lambda "return id(door_contact).state ? \"true\" : \"false\";"
+            imu_healthy: !lambda |-
+              const bool ok = id(imu_ready) &&
+                              (uint32_t)(millis() - id(imu_last_ms)) < 500;
+              return ok ? "true" : "false";
+      - lambda: |-
+          ESP_LOGW("guardian",
+                   "TAMPER: %s swing=%.1f peak_dps=%.1f door_open=%s",
+                   id(tamper_reason).c_str(), id(swing_angle), id(swing_peak_dps),
+                   id(door_contact).state ? "true" : "false");
+  - id: check_spoofed_reed
+    mode: restart
+    then:
+      - delay: 600ms
+      - lambda: |-
+          const uint32_t now = millis();
+          // Reed bounced closed again - not a spoof, a bump.
+          if (!id(door_contact).state) return;
+          const bool imu_ok = id(imu_ready) &&
+                              (uint32_t)(now - id(imu_last_ms)) < 500;
+          // A dead gyro would alarm every real outside open. Skip.
+          if (!imu_ok) return;
+          const bool swung = fabsf(id(swing_angle)) >= 1.5f ||
+                             (id(last_swing_ms) != 0 &&
+                              (uint32_t)(now - id(last_swing_ms)) <= 1600);
+          if (swung) return;
+          if (id(tamper_last_ms) != 0 &&
+              (uint32_t)(now - id(tamper_last_ms)) < 15000) return;
+          id(tamper_reason) = "spoofed_contact";
+          id(tamper_last_ms) = now;
+          id(fire_tamper).execute();
+
+interval:
+  - interval: 20ms
+    then:
+      - lambda: |-
+          if (!id(accel_x).has_state() || !id(accel_y).has_state() ||
+              !id(accel_z).has_state() || !id(gyro_x).has_state() ||
+              !id(gyro_y).has_state() || !id(gyro_z).has_state()) {
+            return;
+          }
+
+          const float ax = id(accel_x).state;
+          const float ay = id(accel_y).state;
+          const float az = id(accel_z).state;
+          const float rgx = id(gyro_x).state;
+          const float rgy = id(gyro_y).state;
+          const float rgz = id(gyro_z).state;
+
+          if (std::isnan(ax) || std::isnan(ay) || std::isnan(az) ||
+              std::isnan(rgx) || std::isnan(rgy) || std::isnan(rgz)) {
+            return;
+          }
+
+          const uint32_t now = millis();
+          // Liveness: a wedged I2C bus keeps the last state forever, so watch
+          // for the value actually changing rather than merely existing.
+          if (ax != id(imu_last_ax)) {
+            id(imu_last_ax) = ax;
+            id(imu_last_ms) = now;
+          }
+
+          float dt = id(loop_last_ms) == 0
+                       ? 0.02f
+                       : (float)(uint32_t)(now - id(loop_last_ms)) / 1000.0f;
+          id(loop_last_ms) = now;
+          // The display push can stall the loop; clamp so one long frame does
+          // not inject a bogus jump into the swing integrator.
+          if (dt <= 0.0f || dt > 0.20f) dt = 0.02f;
+
+          const float a_norm = sqrtf(ax * ax + ay * ay + az * az);
+
+          // Largest change since the previous sample, per family of axes.
+          const float da = id(prev_valid)
+                             ? std::max(std::max(fabsf(ax - id(prev_ax)),
+                                                 fabsf(ay - id(prev_ay))),
+                                        fabsf(az - id(prev_az)))
+                             : 999.0f;
+          const float dw = id(prev_valid)
+                             ? std::max(std::max(fabsf(rgx - id(prev_gx)),
+                                                 fabsf(rgy - id(prev_gy))),
+                                        fabsf(rgz - id(prev_gz)))
+                             : 999.0f;
+          id(prev_ax) = ax; id(prev_ay) = ay; id(prev_az) = az;
+          id(prev_gx) = rgx; id(prev_gy) = rgy; id(prev_gz) = rgz;
+          id(prev_valid) = true;
+
+          // ---- Startup: capture the rest reference and the gyro zero-rate ----
+          // Requires ~1 s of genuine stillness rather than grabbing whatever the
+          // very first sample happened to be.
+          //
+          // Stillness is judged on how much consecutive samples DIFFER, never on
+          // the absolute gyro magnitude: the whole point of this block is to
+          // learn the zero-rate offset, and a typical MPU6050 sits 2-5 deg/s off
+          // zero at rest. An absolute test would simply never pass on many
+          // parts, leaving the sensor permanently uncalibrated.
+          //
+          // The door must also be shut - that is the only pose in which "rest"
+          // means anything - and gravity must read ~1 g, which rules out being
+          // powered up mid-swing (the handle sits ~0.85 m out from the hinge, so
+          // any real swing shows up as centripetal acceleration here).
+          if (!id(imu_ready)) {
+            const bool still = !id(door_contact).state &&
+                               fabsf(a_norm - 9.81f) < 1.0f &&
+                               da < 0.5f && dw < 2.0f;
+            if (!still) {
+              id(rest_settle_ms) = 0;
+              return;
+            }
+            if (id(rest_settle_ms) == 0) {
+              id(rest_settle_ms) = now;
+              id(g_rest_x) = ax; id(g_rest_y) = ay; id(g_rest_z) = az;
+              id(g_now_x) = ax;  id(g_now_y) = ay;  id(g_now_z) = az;
+              id(bias_gx) = rgx; id(bias_gy) = rgy; id(bias_gz) = rgz;
+              return;
+            }
+            constexpr float k = 0.1f;
+            id(g_rest_x) += k * (ax - id(g_rest_x));
+            id(g_rest_y) += k * (ay - id(g_rest_y));
+            id(g_rest_z) += k * (az - id(g_rest_z));
+            id(bias_gx) += k * (rgx - id(bias_gx));
+            id(bias_gy) += k * (rgy - id(bias_gy));
+            id(bias_gz) += k * (rgz - id(bias_gz));
+            id(g_now_x) = id(g_rest_x);
+            id(g_now_y) = id(g_rest_y);
+            id(g_now_z) = id(g_rest_z);
+            if ((uint32_t)(now - id(rest_settle_ms)) >= 1000) {
+              id(imu_ready) = true;
+            }
+            return;
+          }
+
+          const float wx = rgx - id(bias_gx);
+          const float wy = rgy - id(bias_gy);
+          const float wz = rgz - id(bias_gz);
+          const float w_mag = sqrtf(wx * wx + wy * wy + wz * wz);
+
+          // ---- Fast gravity estimate (tau ~120 ms) ----
+          constexpr float alpha_fast = 0.143f;   // 20 ms / (120 ms + 20 ms)
+          id(g_now_x) += alpha_fast * (ax - id(g_now_x));
+          id(g_now_y) += alpha_fast * (ay - id(g_now_y));
+          id(g_now_z) += alpha_fast * (az - id(g_now_z));
+
+          const float gn = sqrtf(id(g_now_x) * id(g_now_x) +
+                                 id(g_now_y) * id(g_now_y) +
+                                 id(g_now_z) * id(g_now_z));
+          const float gr = sqrtf(id(g_rest_x) * id(g_rest_x) +
+                                 id(g_rest_y) * id(g_rest_y) +
+                                 id(g_rest_z) * id(g_rest_z));
+          if (gn < 1.0f || gr < 1.0f) return;   // free-fall or garbage
+
+          const float nx = id(g_now_x) / gn, ny = id(g_now_y) / gn, nz = id(g_now_z) / gn;
+          const float rx = id(g_rest_x) / gr, ry = id(g_rest_y) / gr, rz = id(g_rest_z) / gr;
+
+          // ---- Lever angle: the tilt of gravity away from its rest direction.
+          // A door swing rotates about gravity, so it contributes nothing here.
+          float cosang = nx * rx + ny * ry + nz * rz;
+          if (cosang > 1.0f) cosang = 1.0f;
+          if (cosang < -1.0f) cosang = -1.0f;
+          id(lever_deg) = acosf(cosang) * 57.2957795f;
+
+          // ---- Swing rate: the component of rotation about gravity.
+          // A lever press rotates about a horizontal axis, so it contributes
+          // nothing here. No mounting angle needed for either projection.
+          id(swing_dps) = wx * nx + wy * ny + wz * nz;
+
+          // ---- Vibration: key turn, knock, impact. Sustained tilt does not
+          // show up here, which is what separates a press from a jimmy.
+          id(vibration) += 0.30f * (fabsf(a_norm - gr) - id(vibration));
+
+          const bool door_open = id(door_contact).state;   // true = open
+          const float tilt_thr = id(handle_tilt_threshold).state;
+          const float swing_thr = id(swing_rate_threshold).state;
+          const bool at_rest = id(lever_deg) < 3.0f && w_mag < 3.0f;
+
+          // ---- Rest reference and gyro bias: adapt only while genuinely still
+          // and shut, so a held lever or an open door can never become "rest".
+          if (!door_open && at_rest) {
+            constexpr float alpha_rest = 0.00067f;   // tau ~30 s
+            id(g_rest_x) += alpha_rest * (ax - id(g_rest_x));
+            id(g_rest_y) += alpha_rest * (ay - id(g_rest_y));
+            id(g_rest_z) += alpha_rest * (az - id(g_rest_z));
+            id(bias_gx) += alpha_rest * (rgx - id(bias_gx));
+            id(bias_gy) += alpha_rest * (rgy - id(bias_gy));
+            id(bias_gz) += alpha_rest * (rgz - id(bias_gz));
+          }
+
+          // ---- Lever press state machine ----
+          // A press must exceed the threshold AND hold for 100 ms AND be seen
+          // while the leaf is not rotating.
+          //
+          // The dwell requirement separates a real rotation from a knock or a
+          // jimmy: an impulse has no plateau.
+          //
+          // The swing_quiet requirement matters just as much. An accelerometer
+          // measures specific force, not gravity, and this one sits ~0.85 m out
+          // from the hinge: a 70 deg/s swing adds ~1.3 m/s2 of centripetal
+          // acceleration, and the angular acceleration of getting there adds
+          // several m/s2 more. That tilts the measured gravity vector by roughly
+          // 7 deg steady-state and considerably more during spin-up - easily
+          // enough to read as a lever press and hand back a false "inside".
+          //
+          // Gating on it costs nothing, because the latch physically has to be
+          // retracted BEFORE the leaf can move: a genuine lever press always
+          // happens while the door is still stationary, which is exactly when
+          // this measurement is exact.
+          const bool swing_quiet = fabsf(id(swing_dps)) < swing_thr;
+          if (id(lever_deg) >= tilt_thr && swing_quiet) {
+            if (id(lever_press_start_ms) == 0) {
+              id(lever_press_start_ms) = now;
+            }
+            if ((uint32_t)(now - id(lever_press_start_ms)) >= 100) {
+              if (id(lever_onset_ms) == 0) {
+                id(lever_onset_ms) = id(lever_press_start_ms);
+                id(lever_peak_deg) = 0.0f;
+              }
+              id(lever_last_active_ms) = now;
+              if (id(lever_deg) > id(lever_peak_deg)) {
+                id(lever_peak_deg) = id(lever_deg);
+              }
+              if (door_open) {
+                id(lever_active_since_open) = true;
+              }
+              if (!id(handle_depressed).state) {
+                id(handle_depressed).publish_state(true);
+              }
+            }
+          } else {
+            id(lever_press_start_ms) = 0;
+            if (id(handle_depressed).state && id(lever_last_active_ms) != 0 &&
+                (uint32_t)(now - id(lever_last_active_ms)) > 400) {
+              id(handle_depressed).publish_state(false);
+            }
+          }
+          // Retire a finished press once it is older than the lookback window,
+          // so stale evidence can never classify a later opening.
+          if (id(lever_onset_ms) != 0 && !id(handle_depressed).state &&
+              (uint32_t)(now - id(lever_last_active_ms)) >
+                  (uint32_t) id(handle_lookback).state) {
+            id(lever_onset_ms) = 0;
+            id(lever_peak_deg) = 0.0f;
+          }
+
+          // ---- Swing integration ----
+          if (fabsf(id(swing_dps)) >= swing_thr) {
+            id(last_swing_ms) = now;
+            id(swing_angle) += id(swing_dps) * dt;
+            if (fabsf(id(swing_dps)) > fabsf(id(swing_peak_dps))) {
+              id(swing_peak_dps) = id(swing_dps);
+            }
+            if (!id(door_moving).state) {
+              id(door_moving).publish_state(true);
+            }
+          } else if (id(door_moving).state && id(last_swing_ms) != 0 &&
+                     (uint32_t)(now - id(last_swing_ms)) > 800) {
+            id(door_moving).publish_state(false);
+          }
+          if (id(vibration) > id(vib_peak)) {
+            id(vib_peak) = id(vibration);
+          }
+          if (door_open && fabsf(id(swing_angle)) > id(open_max_angle)) {
+            id(open_max_angle) = fabsf(id(swing_angle));
+          }
+          // Re-zero the swing reference whenever the door has been shut and
+          // still for a while - that is the only known-good 0 degrees.
+          if (!door_open && at_rest && id(last_swing_ms) != 0 &&
+              (uint32_t)(now - id(last_swing_ms)) > 2000) {
+            id(swing_angle) = 0.0f;
+            id(vib_peak) = 0.0f;
+          }
+
+          // ---- Tamper: magnet defeat ----
+          // Leaf rotated while the reed still reads closed. Not a case-movement
+          // threshold: the IMU is on the lever and moves on every normal open.
+          // Skip the close-slam window, require a wind-tolerant angle for a
+          // few hundred milliseconds, and do not fire if the gyro is unhealthy.
+          const bool imu_ok = id(imu_ready) &&
+                              (uint32_t)(now - id(imu_last_ms)) < 500;
+          const uint32_t closed_for = (!door_open && id(door_closed_ms) != 0)
+                                        ? (uint32_t)(now - id(door_closed_ms))
+                                        : 0;
+          constexpr float TAMPER_SWING_DEG = 15.0f;
+          constexpr uint32_t TAMPER_HOLD_MS = 350;
+          constexpr uint32_t TAMPER_CLOSED_MS = 1000;
+          constexpr uint32_t TAMPER_COOLDOWN_MS = 15000;
+          if (!door_open && imu_ok && closed_for >= TAMPER_CLOSED_MS &&
+              fabsf(id(swing_angle)) >= TAMPER_SWING_DEG) {
+            if (id(tamper_magnet_start_ms) == 0) {
+              id(tamper_magnet_start_ms) = now;
+            } else if ((uint32_t)(now - id(tamper_magnet_start_ms)) >= TAMPER_HOLD_MS &&
+                       (id(tamper_last_ms) == 0 ||
+                        (uint32_t)(now - id(tamper_last_ms)) >= TAMPER_COOLDOWN_MS)) {
+              id(tamper_reason) = "magnet_defeat";
+              id(tamper_last_ms) = now;
+              id(tamper_magnet_start_ms) = 0;
+              id(fire_tamper).execute();
+            }
+          } else {
+            id(tamper_magnet_start_ms) = 0;
+          }
+  # ---------------------------------------------------------------------------
+  # OFFLINE SIREN. UNBUILT AND UNHEARD - see the note in globals:.
+  #
+  # Runs every second rather than inside the 20 ms physics loop: nothing here is
+  # time-critical to a fraction of a second, and the physics loop is already
+  # sharing the main task with a 63 KB display push.
+  # ---------------------------------------------------------------------------
+  - interval: 1s
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const bool linked = id(api_status).state;
+
+          // ---- 1. AUTHORITY --------------------------------------------------
+          // Refreshed only while a live Home Assistant is answering. This is the
+          // whole basis for acting alone later, so it is taken from the status
+          // binary_sensor (ESPHome's own view of the connection) and never from
+          // api_client_count, which can stick above zero when a socket dies
+          // without firing its handler - i.e. stick claiming CONNECTED.
+          if (linked) {
+            id(offline_auth) = id(ha_elevated_mode).has_state() &&
+                               id(ha_elevated_mode).state;
+            id(offline_auth_ms) = now;
+            // Home Assistant is back and owns the alarm again. Drop the local
+            // latch so the next outage starts clean.
+            id(offline_silenced) = false;
+          }
+
+          // Has the belief gone stale? Counted from the last confirmation by a
+          // live Home Assistant. Rollover-safe subtraction, like every other
+          // elapsed test in this file.
+          const uint32_t auth_ms = (uint32_t) (id(offline_authority_hours).state * 3600000.0f);
+          const bool auth_fresh = id(offline_auth) &&
+                                  id(offline_auth_ms) != 0 &&
+                                  (uint32_t)(now - id(offline_auth_ms)) <= auth_ms;
+
+          // ---- 2. THE CAP ----------------------------------------------------
+          // Checked before anything can extend the siren, so no path below can
+          // outrun it.
+          if (id(offline_siren_on)) {
+            const uint32_t cap_ms = (uint32_t) (id(offline_siren_max_minutes).state * 60000.0f);
+            if ((uint32_t)(now - id(offline_siren_start_ms)) >= cap_ms) {
+              id(offline_siren_on) = false;
+              id(offline_stop_reason) = 3;  // 3 = duration cap
+              id(offline_siren_seconds) += (int) ((uint32_t)(now - id(offline_siren_start_ms)) / 1000);
+              ESP_LOGW("guardian", "Offline siren stopped: duration cap reached");
+            }
+          }
+
+          // Home Assistant came back while the local siren was running. It owns
+          // the alarm now - stop making noise on our own authority and let the
+          // Major Alarm Handler decide, so the two cannot fight over the
+          // DFPlayer (a play_mp3 aborts whatever is already playing).
+          if (id(offline_siren_on) && linked) {
+            id(offline_siren_on) = false;
+            id(offline_stop_reason) = 4;  // 4 = Home Assistant returned
+            id(offline_siren_seconds) += (int) ((uint32_t)(now - id(offline_siren_start_ms)) / 1000);
+            ESP_LOGI("guardian", "Offline siren stopped: Home Assistant reconnected");
+          }
+
+          // ---- 3. SOUND IT ---------------------------------------------------
+          // Re-pressed every 3s for the same reason the Home Assistant loop
+          // does: file 4 is finite, and there is no busy pin wired, so the only
+          // way to keep a continuous noise is to restart it.
+          if (id(offline_siren_on) &&
+              (id(offline_siren_last_ms) == 0 ||
+               (uint32_t)(now - id(offline_siren_last_ms)) >= 3000)) {
+            id(offline_siren_last_ms) = now;
+            id(dfplayer_unit).play_mp3(4);
+          }
+
+          // ---- 4. THE WATCHDOG THAT REPLACES reboot_timeout -------------------
+          // Both reboot_timeouts are 0s (see the wifi: and api: blocks), so the
+          // self-heal that used to be automatic is done here instead - and
+          // skipped in exactly the two states where rebooting would throw away
+          // the thing this device is for. A reboot revokes authority and
+          // silences the siren, which is safe as an outcome and catastrophic as
+          // a surprise.
+          // Seeded from the FIRST tick, not from the first successful connection.
+          //
+          // Written as `last_linked_ms != 0` first, which meant a device that had
+          // never reached Home Assistant since boot could never satisfy the
+          // test - so with reboot_timeout at 0s a portal that came up into a
+          // wedged Wi-Fi stack would sit there forever. That is strictly worse
+          // than the 15-minute default this replaced, and it is the exact case
+          // the default existed for: not "the link dropped", but "the link never
+          // came up". Seeding on the first tick makes the boot window count like
+          // any other quarter of an hour without Home Assistant.
+          static uint32_t last_linked_ms = 0;
+          if (last_linked_ms == 0)
+            last_linked_ms = now;
+          if (linked) {
+            last_linked_ms = now;
+          } else if ((uint32_t)(now - last_linked_ms) > 900000 &&
+                     !id(offline_siren_on) && !auth_fresh) {
+            ESP_LOGW("guardian", "No Home Assistant for 15 min and no local authority - rebooting");
+            App.safe_reboot();
+          }
+      # 45 s, deliberately longer than the 40 s timer.guardian_mfa_window it
+      # lives inside. At the old 30 s the buffer emptied ten seconds before the
+      # countdown the screen is showing ran out, so the display contradicted
+      # itself.
+      - lambda: |-
+          if (!id(current_pin).empty() &&
+              (uint32_t)(millis() - id(last_key_time)) > 45000) {
+            id(current_pin).clear();
+          }
+      # Digits must not survive the challenge they were typed into. The idle
+      # flush above is 45s, deliberately longer than the 40s MFA window, so
+      # without this a challenge that ended early - answered, cancelled,
+      # superseded by another scan, or cleared by the reset script - left up to
+      # 45 seconds of half-typed PIN in the buffer for the next person to
+      # unknowingly extend and submit.
+      - lambda: |-
+          const std::string s = id(portal_display_state).state;
+          const bool keep_pin = s == "MFA" || s == "CHALLENGE" ||
+                                s.rfind("PIN_CHANGE", 0) == 0;
+          if (!keep_pin && !id(current_pin).empty()) {
+            id(current_pin).clear();
+          }
+      # Night dimming. The backlight has always been exposed to Home Assistant
+      # and driven by nothing at all. An alarm always wins, and any keypress,
+      # card, or door event brings it straight back up.
+      - lambda: |-
+          const ESPTime t = id(ha_time).now();
+          const bool night = t.is_valid() && (t.hour >= 23 || t.hour < 7);
+          const bool idle = (uint32_t)(millis() - id(ui_last_activity_ms)) > 60000;
+          const bool alarm = id(portal_display_state).state == "ALARM";
+          const float target = (alarm || !night || !idle) ? 1.0f : 0.25f;
+          if (fabsf(target - id(ui_backlight)) > 0.01f) {
+            id(ui_backlight) = target;
+            auto call = id(backlight).turn_on();
+            call.set_brightness(target);
+            call.set_transition_length(500);
+            call.perform();
+          }
+
+
+matrix_keypad:
+  id: keypad
+  rows:
+    - pin: GPIO4
+    - pin: GPIO7
+    - pin: GPIO6
+    - pin: GPIO5
+  columns:
+    - pin: GPIO1
+    - pin: GPIO2
+    - pin: GPIO15
+  keys: "123456789*0#"
+  has_diodes: false
+  on_key:
+    # Enrollment and PIN-change reassign the keypad, so work out first whether
+    # this press belongs to enrollment, PIN-change, or the PIN buffer.
+    #
+    # PIN entry for an MFA or entry challenge always wins. Those are both
+    # time-limited and both end in an alarm if unanswered, whereas enrollment
+    # and PIN-change are convenience features armed from the HA UI - having
+    # either swallow the digits of a PIN somebody is racing a countdown to
+    # enter would be a security bug, not a UI quirk.
+    #
+    # PIN-change then outranks enrollment: both are UI-armed, they are
+    # mutually exclusive Home Assistant-side, and this is defense in depth
+    # if both booleans are somehow on.
+    - lambda: |-
+        id(ui_last_activity_ms) = millis();
+
+        // OFFLINE SIREN, STOP 2 OF 2: ANY key, no card, no PIN.
+        // UNBUILT AND UNHEARD.
+        //
+        // Runs before the routing below and returns nothing - the press still
+        // falls through to whatever it would otherwise have done, so this
+        // cannot swallow a digit somebody is typing.
+        //
+        // Unconditional on purpose, and this is the constraint that was written
+        // down hardest: a local siren Home Assistant cannot silence needs a
+        // local way to stop it, or it becomes the reason somebody unplugs the
+        // portal for good - and then the alarm is gone permanently instead of
+        // for one evening. The person standing in front of a noise they cannot
+        // stop will always win; the only choice is whether they win by pressing
+        // a key or by removing the fuse.
+        //
+        // Yes, an intruder can press it. They can also press it after breaking
+        // in, having already been sounded at, from inside a house whose siren
+        // has already done the one thing it can do. The threat model here is
+        // noise and attention, not access control - this key opens nothing.
+        // Every silence is counted and reported to Home Assistant on reconnect,
+        // so it is on the record rather than invisible.
+        if (id(offline_siren_on)) {
+          id(offline_siren_on) = false;
+          id(offline_silenced) = true;
+          id(offline_stop_reason) = 2;  // 2 = local silence, no credential
+          id(offline_siren_seconds) +=
+              (int) ((uint32_t)(millis() - id(offline_siren_start_ms)) / 1000);
+          ESP_LOGW("guardian", "Offline siren stopped: local silence at the keypad");
+        }
+
+        id(kp_pin_change) = id(ha_pin_change_mode).state &&
+                            !id(ha_mfa_pending).state &&
+                            !id(ha_entry_challenge).state;
+        id(kp_enroll) = id(ha_enrollment_mode).state &&
+                        !id(ha_mfa_pending).state &&
+                        !id(ha_entry_challenge).state &&
+                        !id(ha_pin_change_mode).state;
+    - if:
+        condition:
+          lambda: 'return id(kp_enroll);'
+        then:
+          # 1-N picks the slot the next card is written to (N is
+          # sensor.guardian_rfid_slot_map's length, capped at 9). This is what
+          # makes enrollment work at all once every slot is occupied: the system
+          # will not choose somebody's card to overwrite on its own.
+          #
+          # 0 toggles guest enrollment for the next card (visitor = always away).
+          # * clears the choice and hands the decision back to first-free.
+          # # ends the session - enrollment no longer switches itself off after
+          # one card, so this is the way out that does not involve walking to a
+          # computer. Nothing here touches current_pin; a stray digit pressed
+          # during enrollment must not end up in a PIN.
+          - lambda: |-
+              id(current_pin) = "";
+              int n = 4;
+              if (id(ha_slot_map).has_state()) {
+                const std::string &sm = id(ha_slot_map).state;
+                if (!sm.empty() && sm != "unknown" && sm != "unavailable") {
+                  n = (int) sm.size();
+                  if (n < 1) n = 1;
+                  if (n > 9) n = 9;
+                }
+              }
+              if (x >= '1' && x <= ('0' + n)) {
+                id(kp_event) = std::string(1, x);
+              } else if (x == '*') {
+                id(kp_event) = "";
+              } else {
+                id(kp_event) = "ignore";
+              }
+          - if:
+              condition:
+                lambda: 'return x == ''#'';'
+              then:
+                - homeassistant.event:
+                    event: esphome.enrollment_cancel
+              else:
+                - if:
+                    condition:
+                      lambda: 'return x == ''0'';'
+                    then:
+                      - homeassistant.event:
+                          event: esphome.enrollment_guest_toggled
+                    else:
+                      - if:
+                          condition:
+                            lambda: 'return id(kp_event) != "ignore";'
+                          then:
+                            - homeassistant.event:
+                                event: esphome.enrollment_slot_selected
+                                data:
+                                  slot: !lambda 'return id(kp_event);'
+        else:
+          - lambda: |-
+              if (x == '#') {
+                return;
+              } else if (x == '*') {
+                if (id(current_pin).length() > 0) id(current_pin).pop_back();
+              } else {
+                if (id(current_pin).length() < 6) {
+                  id(current_pin) += x;
+                  id(last_key_time) = millis();
+                }
+              }
+    # Submit and cancel are mutually exclusive. These used to be two sibling
+    # `if`s, and the submit branch cleared current_pin before the cancel branch
+    # ran its length check - so every 4-6 digit # during PIN-change also fired
+    # esphome.pin_change_cancel. Home Assistant then tore the session down the
+    # instant the current PIN was accepted.
+    #
+    # Without the length guard, a bare # fired esphome.pin_entered with an empty
+    # string. Home Assistant hashed "" to e3b0c442... , failed the comparison,
+    # and counted a failed attempt - so three stray presses of # by someone
+    # leaning on the panel raised a full major alarm. A single digit followed by
+    # # was likewise a complete, countable attempt.
+    #
+    # 4 is the minimum length script.guardian_set_pin will store, and the buffer
+    # is capped at 6 above, so this accepts exactly the range that can be valid.
+    #
+    # Safe during enrollment without an extra guard: the enrollment branch above
+    # clears current_pin on every press, so the length test can never pass there.
+    - if:
+        condition:
+          lambda: 'return x == ''#'';'
+        then:
+          - if:
+              condition:
+                lambda: 'return id(current_pin).length() >= 4;'
+              then:
+                - homeassistant.event:
+                    event: esphome.pin_entered
+                    data:
+                      pin: !lambda 'return id(current_pin);'
+                - lambda: 'id(current_pin) = "";'
+              else:
+                - if:
+                    condition:
+                      lambda: 'return id(kp_pin_change);'
+                    then:
+                      - homeassistant.event:
+                          event: esphome.pin_change_cancel
+                - lambda: 'id(current_pin) = "";'
+
+dfplayer:
+  uart_id: uart_dfplayer
+  # Named so the offline siren can reach it from a lambda. Every other caller is
+  # a `dfplayer.play_mp3:` action, which does not need an id; the offline path
+  # decides in C++ whether to make a noise at all, so it needs the object.
+  id: dfplayer_unit
+
+button:
+  # The doorbell has always had one; the portal did not, so there was no way to
+  # reboot it short of pulling power or a reflash. script.guardian_reset offers
+  # an optional device restart and needs this to exist.
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+  - platform: safe_mode
+    name: "Restart in Safe Mode"
+    entity_category: diagnostic
+  # play_mp3 (DFPlayer command 0x12) picks the track by its filename inside the
+  # card's /MP3 folder. The plain play action (0x03) numbers files by the order
+  # they were copied into the card root instead, so a card written out of order
+  # played the wrong sound with no complaint. The numbers below are the digits
+  # in /MP3/000N.mp3 - see section 8 of docs/documentation/interior-portal/ for
+  # the full card layout. Firmware and card have to be updated together.
+  - platform: template
+    name: "Play Doorbell"
+    id: play_doorbell
+    on_press:
+      - dfplayer.play_mp3:
+          file: 1
+  - platform: template
+    name: "Play Denied"
+    id: play_denied
+    on_press:
+      - dfplayer.play_mp3:
+          file: 2
+  - platform: template
+    name: "Play MFA Challenge"
+    id: play_mfa
+    on_press:
+      - dfplayer.play_mp3:
+          file: 3
+  - platform: template
+    name: "Play Alarm"
+    id: play_alarm
+    on_press:
+      - dfplayer.play_mp3:
+          file: 4
+  - platform: template
+    name: "Play Welcome"
+    id: play_welcome
+    on_press:
+      - dfplayer.play_mp3:
+          file: 5
+  # Re-learn the closed-door, lever-at-rest orientation. Not normally needed -
+  # the detection loop maintains it automatically - but useful straight after
+  # re-mounting the sensor housing. Press with the door shut and hands off.
+  - platform: template
+    name: "Calibrate Door Rest"
+    id: calibrate_door_rest
+    icon: mdi:target
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(imu_ready) = false;
+          id(rest_settle_ms) = 0;
+          id(prev_valid) = false;
+          id(lever_onset_ms) = 0;
+          id(lever_peak_deg) = 0.0f;
+          id(swing_angle) = 0.0f;
+          id(loop_last_ms) = 0;
+
+
+text_sensor:
+  - platform: homeassistant
+    id: portal_display_state
+    entity_id: input_text.portal_display_state
+    internal: true
+  # Unix epoch of the active window's expiry. Imported as TEXT, not as a number:
+  # an ESPHome numeric sensor is a float, and a float only holds integers exactly
+  # up to 2^24, so a ~1.8e9 epoch would quantise to the nearest ~128 seconds.
+  - platform: homeassistant
+    id: ha_countdown_ends
+    entity_id: sensor.guardian_portal_countdown_ends
+    internal: true
+  - platform: homeassistant
+    id: ha_countdown_label
+    entity_id: sensor.guardian_portal_countdown_label
+    internal: true
+  # Which slot the next enrolled card is written to: the keypad choice, else the
+  # first free slot, else "none" when every slot is occupied and nobody has
+  # chosen. Computed Home Assistant-side so the promise this screen makes and the
+  # slot process_rfid_scan actually writes cannot drift apart.
+  - platform: homeassistant
+    id: ha_enroll_target
+    entity_id: sensor.guardian_enrollment_target_slot
+    internal: true
+  # Variable-length "X" occupied / "-" free, for the slot picker. The string's
+  # length is the slot count; this firmware does not compile in a rack size.
+  - platform: homeassistant
+    id: ha_slot_map
+    entity_id: sensor.guardian_rfid_slot_map
+    internal: true
+  - platform: homeassistant
+    id: ha_faults
+    entity_id: sensor.guardian_faults
+    internal: true
+  - platform: homeassistant
+    id: ha_presence
+    entity_id: sensor.guardian_presence_summary
+    internal: true
+  # "Anton|HOME;Sam|AWAY;Maria|GUEST". Drawn on idle page 1 (KEYS).
+  # Packed so the ESP32 splits; the separators are never rendered.
+  - platform: homeassistant
+    id: ha_presence_roster
+    entity_id: sensor.guardian_presence_roster
+    internal: true
+  # Same order as sensor.guardian_rfid_slot_map: "Anton;-;Sam". Empty is "-".
+  - platform: homeassistant
+    id: ha_key_labels
+    entity_id: sensor.guardian_rfid_key_labels
+    internal: true
+  - platform: homeassistant
+    id: ha_enroll_pending_name
+    entity_id: input_text.guardian_enroll_pending_name
+    internal: true
+  - platform: homeassistant
+    id: ha_alarm_reason
+    entity_id: input_text.guardian_alarm_reason
+    internal: true
+  - platform: homeassistant
+    id: ha_last_door
+    entity_id: input_text.guardian_last_door_summary
+    internal: true
+  # "OK -58" / "OFFLINE 12m" / "NO DATA". Formatted in Jinja like every other
+  # import here, so the ESP32 does no string assembly.
+  - platform: homeassistant
+    id: ha_doorbell_link
+    entity_id: sensor.guardian_doorbell_link
+    internal: true
+
+font:
+  # Explicit glyph set on every font. The default set omits several characters
+  # used here (notably "/" and the "·" separator that arrives inside the Home
+  # Assistant summary strings), and a missing glyph renders as nothing at all.
+  - file: "gfonts://Roboto"
+    id: font_tiny
+    size: 10
+    glyphs: &ui_glyphs " !\"#%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]_abcdefghijklmnopqrstuvwxyz°·"
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 13
+    glyphs: *ui_glyphs
+  - file: "gfonts://Roboto"
+    id: font_main
+    size: 18
+    glyphs: *ui_glyphs
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 22
+    glyphs: *ui_glyphs
+
+color:
+  - id: bg_color
+    red: 5%
+    green: 5%
+    blue: 5%
+  - id: col_panel
+    red: 14%
+    green: 14%
+    blue: 16%
+  - id: col_track
+    red: 25%
+    green: 25%
+    blue: 28%
+  - id: text_muted
+    red: 50%
+    green: 50%
+    blue: 50%
+  - id: accent_blue
+    red: 20%
+    green: 60%
+    blue: 100%
+  - id: col_green
+    red: 10%
+    green: 90%
+    blue: 30%
+  - id: col_red
+    red: 95%
+    green: 20%
+    blue: 20%
+  - id: col_dark_red
+    red: 35%
+    green: 4%
+    blue: 4%
+  - id: col_amber
+    red: 100%
+    green: 60%
+    blue: 10%
+  - id: col_yellow
+    red: 95%
+    green: 85%
+    blue: 20%
+  - id: col_white
+    red: 95%
+    green: 95%
+    blue: 95%
+
+output:
+  - platform: ledc
+    pin: GPIO39
+    id: led_blue_output
+    inverted: true
+  - platform: ledc
+    pin: GPIO40
+    id: led_green_output
+    inverted: true
+  - platform: ledc
+    pin: GPIO41
+    id: led_red_output
+    inverted: true
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+light:
+  - platform: rgb
+    id: portal_led
+    name: "Portal LED"
+    red: led_red_output
+    green: led_green_output
+    blue: led_blue_output
+    effects:
+      - pulse:
+          name: yellow_pulse
+          transition_length: 500ms
+          update_interval: 500ms
+      - strobe:
+          name: red_flash
+          colors:
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 250ms
+            - state: false
+              duration: 250ms
+  - platform: monochromatic
+    id: backlight
+    name: "Portal Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: ili9xxx
+    id: portal_tft
+    model: ST7789V
+    cs_pin: GPIO10
+    dc_pin: GPIO14
+    reset_pin: GPIO21
+    invert_colors: true
+    dimensions:
+      width: 135
+      height: 240
+      offset_width: 52
+      offset_height: 40
+    rotation: 90
+    update_interval: 200ms
+    # ---------------------------------------------------------------------
+    # 240 x 135 landscape. Three bands, and nothing is ever drawn outside them:
+    #
+    #   y   0 ..  17   status strip - link, door, clock, fault marker
+    #   y  22 .. 104   main zone    - one screen per system state
+    #   y 109 .. 133   footer       - security mode + fault or presence line
+    #
+    # Kept to roughly six elements at a time so it stays readable from across a
+    # hallway rather than turning into a dashboard.
+    # ---------------------------------------------------------------------
+    lambda: |-
+      const int w = it.get_width();          // 240 (135x240 panel, rotated 90)
+      const uint32_t now_ms = millis();
+      const ESPTime t = id(ha_time).now();
+      const bool time_ok = t.is_valid();
+      // ESPHome's own view of the API connection, not the hand-kept
+      // api_client_count. See the note on the status binary_sensor.
+      const bool linked = id(api_status).state;
+      const bool door_open = id(door_contact).state;
+
+      std::string st = id(portal_display_state).state;
+      // The imported text sensor reports these when Home Assistant drops the
+      // entity. The old lambda treated only "unknown" as idle and had no else
+      // branch at all, so "unavailable" rendered an empty screen.
+      if (st == "unavailable" || st == "unknown" || st == "none") st.clear();
+
+      // Any verdict is something a person is meant to read, so it wakes the
+      // backlight and pins the idle rotation back to the first page.
+      //
+      // The sequence counter is checked as well as the string, and it is the
+      // half that matters. Home Assistant emits no state change when a helper is
+      // written the value it already holds, so a REPEATED verdict never moved
+      // portal_display_state: present a card, get GRANTED, present it again
+      // inside the three-second window, and this test saw nothing. That is
+      // exactly the sequence produced by scanning a card straight after
+      // enrolling it, which is why a freshly enrolled card appeared to be
+      // ignored by the screen while its welcome tone still played.
+      // script.guardian_set_display bumps the counter on every write.
+      const int seq = id(ha_display_seq).has_state()
+                        ? (int) id(ha_display_seq).state : -1;
+      if (st != id(ui_prev_state) || seq != id(ui_prev_seq)) {
+        id(ui_prev_state) = st;
+        id(ui_prev_seq) = seq;
+        id(ui_last_activity_ms) = now_ms;
+        id(ui_seq_ms) = now_ms;
+        id(ui_page) = 0;
+        id(ui_page_ms) = now_ms;
+      }
+      // Half a second of accent bar under the status strip on every verdict.
+      // A verdict that repeats the one already showing is otherwise
+      // indistinguishable from the previous one still being displayed.
+      const bool verdict_pulse = id(ui_seq_ms) != 0 &&
+                                 (uint32_t)(now_ms - id(ui_seq_ms)) < 500;
+
+      const std::string faults = (linked && id(ha_faults).has_state())
+                                   ? id(ha_faults).state : std::string();
+      const bool has_fault = !faults.empty() && faults != "unknown" &&
+                             faults != "unavailable";
+
+      // ---- countdown --------------------------------------------------------
+      // Deadline is an absolute epoch, so the bar is immune to link jitter and
+      // to the display's own frame rate: it just recomputes against the clock.
+      int cd_left = -1, cd_total = 0;
+      std::string cd_label;
+      if (linked && time_ok && id(ha_countdown_ends).has_state()) {
+        const long ends = strtol(id(ha_countdown_ends).state.c_str(), nullptr, 10);
+        if (ends > 1000000000L) {
+          cd_left = (int)(ends - (long) t.timestamp);
+          if (cd_left < 0) cd_left = 0;
+          cd_total = id(ha_countdown_total).has_state()
+                       ? (int) id(ha_countdown_total).state : 0;
+          if (id(ha_countdown_label).has_state()) cd_label = id(ha_countdown_label).state;
+        }
+      }
+
+      // ---- small drawing helpers -------------------------------------------
+      auto bar = [&](int x, int y, int bw, int bh, float frac, Color c) {
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        it.filled_rectangle(x, y, bw, bh, id(col_track));
+        const int fill = (int)(bw * frac + 0.5f);
+        if (fill > 0) it.filled_rectangle(x, y, fill, bh, c);
+      };
+
+      auto countdown = [&](int y) {
+        if (cd_left < 0 || cd_total <= 0) return;
+        const float frac = (float) cd_left / (float) cd_total;
+        const Color c = frac > 0.5f ? id(col_green)
+                                    : (frac > 0.2f ? id(col_amber) : id(col_red));
+        it.printf(30, y, id(font_tiny), id(text_muted), TextAlign::TOP_LEFT, "%s",
+                  cd_label.empty() ? "TIME LEFT" : cd_label.c_str());
+        it.printf(210, y, id(font_tiny), c, TextAlign::TOP_RIGHT, "%d:%02d",
+                  cd_left / 60, cd_left % 60);
+        bar(30, y + 12, 180, 9, frac, c);
+      };
+
+      auto headline = [&](const char *big, Color bc, const char *sub, Color sc) {
+        it.printf(w / 2, 52, id(font_big), bc, TextAlign::CENTER, "%s", big);
+        if (sub && sub[0]) {
+          it.printf(w / 2, 80, id(font_small), sc, TextAlign::CENTER, "%s", sub);
+        }
+      };
+
+      auto keyLabel = [&](int idx0) -> std::string {
+        std::string raw = id(ha_key_labels).has_state()
+                            ? id(ha_key_labels).state : std::string();
+        if (raw == "unknown" || raw == "unavailable" || raw == "none") raw.clear();
+        int i = 0;
+        size_t start = 0;
+        while (start <= raw.size()) {
+          size_t sep = raw.find(';', start);
+          if (sep == std::string::npos) sep = raw.size();
+          if (i == idx0) {
+            std::string p = raw.substr(start, sep - start);
+            if (p == "-" || p.empty()) return std::string();
+            return p;
+          }
+          if (sep >= raw.size()) break;
+          start = sep + 1;
+          i++;
+        }
+        return std::string();
+      };
+
+      auto pendingName = [&]() -> std::string {
+        std::string n = id(ha_enroll_pending_name).has_state()
+                          ? id(ha_enroll_pending_name).state : std::string();
+        if (n == "unknown" || n == "unavailable" || n == "none") n.clear();
+        const size_t sp = n.find(' ');
+        if (sp != std::string::npos) n = n.substr(0, sp);
+        if (n.size() > 12) n = n.substr(0, 12);
+        return n;
+      };
+
+      // ============ OFFLINE ALARM: owns the screen, outranks everything ======
+      //
+      // Above the ALARM branch, because during an outage `st` is a cached Home
+      // Assistant value that is by definition stale - it could still read IDLE
+      // from before the link dropped while this device is actively sounding.
+      // The screen must describe what the building is doing NOW, and what it is
+      // doing is screaming.
+      //
+      // It also has to answer the question the person standing in front of it
+      // is actually asking, which is "how do I make it stop". They cannot ask
+      // Home Assistant; it is not there. So the instruction is on the screen.
+      // UNBUILT AND UNHEARD.
+      if (id(offline_siren_on)) {
+        const bool flash = (now_ms / 500) % 2 == 0;
+        it.fill(flash ? id(col_red) : id(col_dark_red));
+        it.printf(w / 2, 40, id(font_big), id(col_white), TextAlign::CENTER, "!! ALARM !!");
+        it.printf(w / 2, 72, id(font_small), id(col_white), TextAlign::CENTER,
+                  "No link to Home Assistant");
+        it.printf(w / 2, 94, id(font_tiny), id(col_white), TextAlign::CENTER,
+                  "Scan your key, or press any button");
+        it.printf(w / 2, 112, id(font_tiny), id(col_white), TextAlign::CENTER,
+                  door_open ? "DOOR OPEN" : "DOOR CLOSED");
+        return;
+      }
+
+      // ======================= ALARM: owns the whole screen ==================
+      if (st == "ALARM") {
+        const bool flash = (now_ms / 500) % 2 == 0;
+        it.fill(flash ? id(col_red) : id(col_dark_red));
+        it.printf(w / 2, 45, id(font_big), id(col_white), TextAlign::CENTER, "!! ALARM !!");
+        std::string reason = id(ha_alarm_reason).has_state() ? id(ha_alarm_reason).state
+                                                             : std::string();
+        if (reason == "none" || reason == "unknown" || reason == "unavailable") {
+          reason.clear();
+        }
+        // ~13 px Roboto across 232 px of usable width.
+        if (reason.length() > 36) reason = reason.substr(0, 35) + ".";
+        it.printf(w / 2, 78, id(font_small), id(col_white), TextAlign::CENTER, "%s",
+                  reason.empty() ? "Security notified" : reason.c_str());
+        it.printf(w / 2, 104, id(font_tiny), id(col_white), TextAlign::CENTER,
+                  door_open ? "DOOR OPEN" : "DOOR CLOSED");
+        return;
+      }
+
+      it.fill(id(bg_color));
+
+      // ======================= status strip ==================================
+      // WiFi strength, four bars growing to the right.
+      {
+        int bars = 0;
+        if (id(wifi_connected)) {
+          const float r = id(wifi_rssi).has_state() ? id(wifi_rssi).state : -100.0f;
+          bars = r >= -60.0f ? 4 : (r >= -70.0f ? 3 : (r >= -80.0f ? 2 : 1));
+        }
+        for (int i = 0; i < 4; i++) {
+          const int bh = 3 + 2 * i;
+          it.filled_rectangle(4 + i * 4, 14 - bh, 3, bh,
+                              i < bars ? id(col_white) : id(col_track));
+        }
+      }
+      // Home Assistant link.
+      it.filled_circle(27, 9, 3, linked ? id(col_green) : id(col_red));
+      // Doorbell link. The doorbell has no screen of its own, so this is the
+      // only place its state is visible to someone standing at the door.
+      //
+      // Grey - not red - whenever OUR link is down. The value arrives from Home
+      // Assistant, so when Home Assistant is unreachable it is a cached reading
+      // of unknown age. Showing it as green would be a confident lie about the
+      // one thing this indicator exists to report, and showing it as red would
+      // invent an outage. Grey says "unknown", which is the truth.
+      {
+        const Color dbc = !linked ? id(col_track)
+                                  : (id(ha_doorbell_online).state ? id(col_green)
+                                                                  : id(col_red));
+        it.filled_circle(60, 9, 3, dbc);
+        it.printf(67, 4, id(font_tiny), linked ? id(col_white) : id(text_muted),
+                  TextAlign::TOP_LEFT, "DB");
+      }
+      // Fault marker: a small triangle, drawn only when something is actually wrong.
+      if (has_fault) {
+        it.line(40, 14, 46, 3, id(col_amber));
+        it.line(46, 3, 52, 14, id(col_amber));
+        it.line(40, 14, 52, 14, id(col_amber));
+        it.filled_rectangle(45, 8, 2, 4, id(col_amber));
+      }
+      // Door pill, centred - the single most useful thing the portal knows and
+      // never used to say out loud.
+      if (door_open) {
+        it.filled_rectangle(96, 2, 48, 15, id(col_amber));
+        it.printf(120, 4, id(font_tiny), id(bg_color), TextAlign::TOP_CENTER, "OPEN");
+        // Direction verdict from the reed edge, for tuning the lever/swing
+        // thresholds against what actually happened without digging through
+        // Home Assistant's event log.
+        const std::string &v = id(ev_verdict);
+        Color vc = id(text_muted);
+        const char *vl = "?";
+        if (v == "inside") { vc = id(col_green); vl = "IN"; }
+        else if (v == "outside") { vc = id(accent_blue); vl = "OUT"; }
+        it.printf(150, 4, id(font_tiny), vc, TextAlign::TOP_LEFT, "%s", vl);
+      } else {
+        it.rectangle(96, 2, 48, 15, id(col_track));
+        it.printf(120, 4, id(font_tiny), id(col_green), TextAlign::TOP_CENTER, "CLOSED");
+      }
+      if (time_ok) {
+        it.strftime(236, 3, id(font_tiny), id(col_white), TextAlign::TOP_RIGHT, "%H:%M", t);
+      }
+      // The separator under the status strip doubles as the verdict pulse: for
+      // half a second after any verdict it is redrawn thick and in that
+      // verdict's colour, so a repeated GRANTED reads as a NEW grant rather than
+      // as the previous one still on screen.
+      if (verdict_pulse) {
+        Color pc = id(accent_blue);
+        if (st == "GRANTED") pc = id(col_green);
+        else if (st == "MFA" || st == "CHALLENGE" || st == "ENROLL_PICK" ||
+                 st == "HOLD" || id(ui_writing) || st.rfind("PIN_CHANGE", 0) == 0)
+          pc = id(col_amber);
+        else if (st == "DENIED" || st == "DENIED_CARD" || st == "STOLEN" ||
+                 st == "CLONE" || st == "UNSUPPORTED")
+          pc = id(col_red);
+        it.filled_rectangle(6, 18, w - 12, 3, pc);
+      } else {
+        it.line(6, 19, w - 6, 19, id(col_panel));
+      }
+
+      // ======================= footer ========================================
+      it.line(6, 106, w - 6, 106, id(col_panel));
+      {
+        Color mc = id(col_green);
+        const char *mode = "Normal";
+        if (id(ha_super_surveillance).state || id(ha_elevated_mode).state) {
+          mc = id(col_red); mode = "Super Surveillance";
+        } else if (!linked) {
+          // Without Home Assistant the mode is a guess, and "Normal" is the
+          // least safe guess to display.
+          mc = id(text_muted); mode = "Mode unknown";
+        }
+        it.filled_circle(11, 117, 3, mc);
+        it.printf(19, 111, id(font_tiny), mc, TextAlign::TOP_LEFT, "%s", mode);
+
+        if (has_fault) {
+          it.printf(234, 111, id(font_tiny), id(col_amber), TextAlign::TOP_RIGHT,
+                    "%s", faults.c_str());
+        } else if (linked && id(ha_presence).has_state() &&
+                   !id(ha_presence).state.empty()) {
+          // The full summary includes names ("1/2 home · Anton, Sam") and
+          // overflows Super Surveillance. Names live on idle page 1 now; the
+          // footer keeps the count.
+          std::string p = id(ha_presence).state;
+          const size_t cut = p.find(" ·");
+          if (cut != std::string::npos) p = p.substr(0, cut);
+          if (p.length() > 18) p = p.substr(0, 18);
+          it.printf(234, 111, id(font_tiny), id(text_muted), TextAlign::TOP_RIGHT,
+                    "%s", p.c_str());
+        }
+      }
+
+      // ======================= main zone =====================================
+      // Losing Home Assistant outranks every state below, because every one of
+      // them is rendered from a value the link is no longer refreshing. The old
+      // build kept displaying "SYSTEM ARMED / Ready for Input" indefinitely off
+      // a stale cached string.
+      if (!linked) {
+        headline("NO LINK", id(col_amber), "Home Assistant unreachable",
+                 id(text_muted));
+        it.printf(w / 2, 96, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                  id(wifi_connected) ? "WiFi up - API down" : "WiFi down");
+        return;
+      }
+
+      // A door that opened in elevated mode without a completed passage window.
+      // The door is ALREADY OPEN and this clock is counting down to a full
+      // alarm, which is why it outranks every other countdown and why the
+      // heading says what to do rather than what happened.
+      //
+      // Either proof is accepted: a registered card at the interior reader, or
+      // the master PIN on this keypad. The PIN boxes are drawn from the same
+      // buffer as the MFA screen - the keypad keeps accepting digits during a
+      // challenge even though no MFA challenge is pending.
+      if (st == "CHALLENGE") {
+        it.printf(w / 2, 22, id(font_small), id(col_amber), TextAlign::TOP_CENTER,
+                  "AUTHENTICATE");
+        it.printf(w / 2, 40, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                  "Scan card or enter PIN");
+        const std::string cpin = id(current_pin);
+        const bool creveal = (uint32_t)(now_ms - id(last_key_time)) < 1000;
+        for (int i = 0; i < 6; i++) {
+          const int bx = 39 + i * 28;
+          it.rectangle(bx, 52, 22, 22, id(col_track));
+          if (i < (int) cpin.length()) {
+            if (i == (int) cpin.length() - 1 && creveal) {
+              it.printf(bx + 11, 63, id(font_small), id(col_white), TextAlign::CENTER,
+                        "%c", cpin[i]);
+            } else {
+              it.filled_circle(bx + 11, 63, 4, id(col_white));
+            }
+          }
+        }
+        countdown(80);
+        return;
+      }
+
+      if (st == "MFA") {
+        it.printf(w / 2, 24, id(font_small), id(col_yellow), TextAlign::TOP_CENTER,
+                  "ENTER PIN");
+        const int fails = id(ha_mfa_fails).has_state() ? (int) id(ha_mfa_fails).state : 0;
+        const int tries_left = std::max(0, 3 - fails);
+        it.printf(234, 26, id(font_tiny),
+                  tries_left <= 1 ? id(col_red) : id(text_muted),
+                  TextAlign::TOP_RIGHT, "%d left", tries_left);
+
+        // Six slots, one per accepted digit. The most recent digit stays
+        // legible for a second so a mistyped key is visible before it is masked.
+        const std::string pin = id(current_pin);
+        const bool reveal = (uint32_t)(now_ms - id(last_key_time)) < 1000;
+        for (int i = 0; i < 6; i++) {
+          const int bx = 39 + i * 28;
+          it.rectangle(bx, 42, 22, 26, id(col_track));
+          if (i < (int) pin.length()) {
+            if (i == (int) pin.length() - 1 && reveal) {
+              it.printf(bx + 11, 55, id(font_small), id(col_white), TextAlign::CENTER,
+                        "%c", pin[i]);
+            } else {
+              it.filled_circle(bx + 11, 55, 4, id(col_white));
+            }
+          }
+        }
+        countdown(74);
+        return;
+      }
+
+      if (st.rfind("PIN_CHANGE", 0) == 0) {
+        const bool is_new = st == "PIN_CHANGE_NEW";
+        const char *head = is_new ? "ENTER NEW PIN" : "CURRENT PIN";
+        const char *sub = is_new ? "4 to 6 digits" : "Then press #";
+        const char *foot = is_new ? "Press # to finish" : "Press # to confirm";
+        const Color head_c = is_new ? id(accent_blue) : id(col_amber);
+        it.printf(w / 2, 22, id(font_small), head_c, TextAlign::TOP_CENTER,
+                  "%s", head);
+        it.printf(w / 2, 40, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                  "%s", sub);
+        const std::string cpin = id(current_pin);
+        const bool creveal = (uint32_t)(now_ms - id(last_key_time)) < 1000;
+        for (int i = 0; i < 6; i++) {
+          const int bx = 39 + i * 28;
+          it.rectangle(bx, 52, 22, 22, id(col_track));
+          if (i < (int) cpin.length()) {
+            if (i == (int) cpin.length() - 1 && creveal) {
+              it.printf(bx + 11, 63, id(font_small), id(col_white), TextAlign::CENTER,
+                        "%c", cpin[i]);
+            } else {
+              it.filled_circle(bx + 11, 63, 4, id(col_white));
+            }
+          }
+        }
+        it.printf(30, 88, id(font_tiny), id(col_white), TextAlign::TOP_LEFT,
+                  "%s", foot);
+        if (cd_left >= 0 && cd_total > 0) {
+          it.printf(210, 88, id(font_tiny), id(text_muted), TextAlign::TOP_RIGHT,
+                    "%d:%02d", cd_left / 60, cd_left % 60);
+        }
+        return;
+      }
+
+      // Enrollment writes 9 pages while the tag is still selected. Paint HOLD
+      // from on_write_begin so the prompt is on screen during the write, not
+      // only after Home Assistant receives write_fail. Outranks GRANTED so a
+      // second card in the same session is not hidden under the previous tick.
+      if (id(ui_writing) || st == "HOLD") {
+        headline("HOLD CARD", id(col_amber), "Keep it on the reader", id(col_white));
+        return;
+      }
+
+      if (st == "GRANTED") {
+        // Tick, drawn as three offset strokes so it reads as a thick mark.
+        for (int o = 0; o < 3; o++) {
+          it.line(96, 40 + o, 106, 50 + o, id(col_green));
+          it.line(106, 50 + o, 126, 30 + o, id(col_green));
+        }
+        // Stacked so the bar's lower edge (y+12+9) clears the footer rule at 106.
+        it.printf(w / 2, 56, id(font_main), id(col_green), TextAlign::TOP_CENTER,
+                  "GRANTED");
+        if (cd_left >= 0 && cd_total > 0) {
+          countdown(78);
+        } else {
+          it.printf(w / 2, 80, id(font_small), id(text_muted), TextAlign::TOP_CENTER,
+                    "Proceed through door");
+        }
+        return;
+      }
+
+      // A card the system does not recognise. Its own state, because it is not
+      // a PIN result and must not borrow the PIN subtitle below.
+      if (st == "DENIED_CARD") {
+        headline("DENIED", id(col_red), "Card not recognised", id(col_white));
+        return;
+      }
+
+      if (st == "CLONE") {
+        headline("COPY DETECTED", id(col_red), "This key is no longer valid", id(col_white));
+        return;
+      }
+
+      if (st == "UNSUPPORTED") {
+        // MIFARE Classic 1K has been accepted alongside NTAG21x since the
+        // SAK branch went into guardian_rfid; naming only NTAG here sent
+        // people away with a key the reader would have taken.
+        headline("WRONG CARD", id(col_red), "Use NTAG or MIFARE 1K", id(col_white));
+        return;
+      }
+
+      // Enrollment mode, every slot occupied, no slot chosen yet. The panel
+      // used to say "DENIED / Card not recognised" here, which is both wrong -
+      // the card was never looked up, there was simply nowhere to put it - and
+      // unactionable for the person holding it, since the only explanation was a
+      // persistent notification in the Home Assistant web UI. The system will
+      // not pick somebody's card to overwrite on its own.
+      if (st == "ENROLL_PICK") {
+        int n = 4;
+        if (id(ha_slot_map).has_state()) {
+          const std::string &sm = id(ha_slot_map).state;
+          if (!sm.empty() && sm != "unknown" && sm != "unavailable") {
+            n = (int) sm.size();
+            if (n < 1) n = 1;
+            if (n > 9) n = 9;
+          }
+        }
+        char pick_sub[32];
+        if (n <= 1) snprintf(pick_sub, sizeof(pick_sub), "Press 1 to replace");
+        else snprintf(pick_sub, sizeof(pick_sub), "Press 1-%d to replace", n);
+        headline("ALL KEYS IN USE", id(col_amber), pick_sub, id(col_white));
+        it.printf(w / 2, 96, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                  "Press # to disable mode");
+        return;
+      }
+
+      // The card presented is already registered. Carries its slot number after
+      // a colon, so re-presenting a card is a direct answer to "did that save,
+      // and where?" - previously this fell through to the normal matched-card
+      // path and silently opened a passage window instead.
+      if (st.rfind("ENROLL_DUP", 0) == 0) {
+        char dsub[36];
+        const char slot = st.length() > 11 ? st[11] : '?';
+        const int si = (slot >= '1' && slot <= '9') ? (slot - '1') : -1;
+        std::string nm = si >= 0 ? keyLabel(si) : std::string();
+        if (!nm.empty()) {
+          snprintf(dsub, sizeof(dsub), "Already %s", nm.c_str());
+        } else {
+          snprintf(dsub, sizeof(dsub), "Already registered");
+        }
+        headline("REGISTERED", id(accent_blue), dsub, id(col_white));
+        it.printf(w / 2, 96, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                  "Press # to disable mode");
+        return;
+      }
+
+      // A rejected PIN. The subtitle counts down the attempts remaining in THIS
+      // challenge, which is only meaningful while one is open.
+      //
+      // Both of those qualifications used to be missing, and together they
+      // produced the strangest symptom this system had: present an unknown card
+      // in normal mode, with no PIN challenge anywhere in sight, and the portal
+      // announced "DENIED / 0 PIN tries left" - a password failure for a card,
+      // counting down a counter left over from an unrelated MFA session days
+      // earlier. Home Assistant wrote plain "DENIED" for both causes and the
+      // firmware had no way to tell them apart.
+      if (st == "DENIED") {
+        if (id(ha_mfa_pending).state) {
+          const int fails = id(ha_mfa_fails).has_state() ? (int) id(ha_mfa_fails).state : 0;
+          const int tries_left = std::max(0, 3 - fails);
+          char sub[32];
+          snprintf(sub, sizeof(sub), "%d PIN tries left", tries_left);
+          headline("DENIED", id(col_red), sub,
+                   tries_left <= 1 ? id(col_red) : id(col_white));
+        } else {
+          headline("DENIED", id(col_red), "Wrong PIN", id(col_white));
+        }
+        return;
+      }
+
+      if (st == "STOLEN") {
+        headline("CARD FLAGGED", id(col_red), "Security notified", id(col_white));
+        return;
+      }
+
+      if (st.empty() || st == "IDLE") {
+        // Keypad PIN-change session whose display was wiped back to IDLE (LED
+        // mirror, a reset race). The boolean is still the session flag, so
+        // keep prompting rather than rotating idle pages underneath it.
+        if (id(ha_pin_change_mode).state) {
+          it.printf(w / 2, 22, id(font_small), id(col_amber), TextAlign::TOP_CENTER,
+                    "CURRENT PIN");
+          it.printf(w / 2, 40, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                    "Then press #");
+          const std::string cpin = id(current_pin);
+          const bool creveal = (uint32_t)(now_ms - id(last_key_time)) < 1000;
+          for (int i = 0; i < 6; i++) {
+            const int bx = 39 + i * 28;
+            it.rectangle(bx, 52, 22, 22, id(col_track));
+            if (i < (int) cpin.length()) {
+              if (i == (int) cpin.length() - 1 && creveal) {
+                it.printf(bx + 11, 63, id(font_small), id(col_white),
+                          TextAlign::CENTER, "%c", cpin[i]);
+              } else {
+                it.filled_circle(bx + 11, 63, 4, id(col_white));
+              }
+            }
+          }
+          it.printf(30, 88, id(font_tiny), id(col_white), TextAlign::TOP_LEFT,
+                    "Press # to confirm");
+          if (cd_left >= 0 && cd_label == "PIN CHANGE") {
+            it.printf(210, 88, id(font_tiny), id(text_muted), TextAlign::TOP_RIGHT,
+                      "%d:%02d", cd_left / 60, cd_left % 60);
+          }
+          return;
+        }
+
+        // Enrollment session. This used to be a single "PRESENT CARD" line,
+        // which was silent about the two things somebody standing here actually
+        // needs to know: which slot the card is going into, and how to stop.
+        //
+        // With every slot occupied it asks for a slot instead of promising
+        // an enrollment it cannot perform. Nothing is overwritten until a digit
+        // is pressed. 0 toggles guest enrollment (visitor key = always away).
+        if (id(ha_enrollment_mode).state) {
+          std::string target = id(ha_enroll_target).has_state()
+                                 ? id(ha_enroll_target).state : std::string();
+          const bool target_known = !target.empty() && target != "unknown" &&
+                                    target != "unavailable";
+          // "none" is Home Assistant positively reporting "no slot is
+          // available" - a real answer, and a different thing from no answer.
+          const bool no_free_slot = target_known && target == "none";
+          if (!target_known || no_free_slot) target.clear();
+
+          // -1 means the sensor has never reported. It must NOT be compared
+          // against 0, because "I do not know how many slots are free" and "no
+          // slots are free" lead to opposite screens.
+          const int free_slots = id(ha_free_slots).has_state()
+                                   ? (int) id(ha_free_slots).state : -1;
+          const bool have_slot_data = target_known && free_slots >= 0 &&
+                                      id(ha_slot_map).has_state();
+          const bool guest = id(ha_enroll_as_visitor).has_state() &&
+                             id(ha_enroll_as_visitor).state;
+
+          if (!have_slot_data) {
+            // Missing slot data must still invite a card.
+            //
+            // This screen is COSMETIC. process_rfid_scan computes the target
+            // slot itself, from the helpers, at the moment a card arrives - it
+            // does not read any of the three sensors below, deliberately, so
+            // that enrolling two cards in a row cannot race a template sensor.
+            // So a scan enrolls correctly whatever this screen believes.
+            //
+            // That makes a wrong message here worse than no message. The first
+            // version tested only "target is empty" and announced ALL SLOTS
+            // FULL, which is a confident, false statement about the user's
+            // cards; the second replaced it with a diagnostic that was honest
+            // but equally discouraging. Both stopped people presenting the card
+            // that would have worked. PRESENT CARD is the correct instruction in
+            // every one of these states, so it is what is shown, with the
+            // uncertainty demoted to a footnote.
+            it.printf(w / 2, 24, id(font_small), id(accent_blue),
+                      TextAlign::TOP_CENTER,
+                      guest ? "PRESENT CARD · GUEST" : "PRESENT CARD");
+            it.printf(w / 2, 42, id(font_tiny), id(text_muted),
+                      TextAlign::TOP_CENTER, "Name chosen in Home Assistant");
+            it.printf(w / 2, 60, id(font_tiny), id(col_amber),
+                      TextAlign::TOP_CENTER, "(key list not received)");
+            it.printf(30, 88, id(font_tiny), id(col_white), TextAlign::TOP_LEFT,
+                      "Press # to disable mode");
+            return;
+          }
+
+          if (no_free_slot) {
+            int n = 4;
+            {
+              const std::string &sm = id(ha_slot_map).state;
+              if (!sm.empty() && sm != "unknown" && sm != "unavailable") {
+                n = (int) sm.size();
+                if (n < 1) n = 1;
+                if (n > 9) n = 9;
+              }
+            }
+            char full_sub[40];
+            if (n <= 1) snprintf(full_sub, sizeof(full_sub), "All full - press 1 to replace");
+            else snprintf(full_sub, sizeof(full_sub), "All full - press 1-%d to replace", n);
+            it.printf(w / 2, 24, id(font_small), id(col_amber),
+                      TextAlign::TOP_CENTER,
+                      guest ? "SELECT KEY · GUEST" : "SELECT KEY");
+            it.printf(w / 2, 42, id(font_tiny), id(text_muted),
+                      TextAlign::TOP_CENTER, "%s", full_sub);
+          } else {
+            std::string who = pendingName();
+            char add_sub[40];
+            if (!who.empty()) {
+              snprintf(add_sub, sizeof(add_sub), "Adding %s", who.c_str());
+            } else if (free_slots == 0 && !target.empty()) {
+              const int ti = (target[0] >= '1' && target[0] <= '9') ? (target[0] - '1') : -1;
+              std::string old = ti >= 0 ? keyLabel(ti) : std::string();
+              if (!old.empty()) snprintf(add_sub, sizeof(add_sub), "Replacing %s", old.c_str());
+              else snprintf(add_sub, sizeof(add_sub), "Replacing a key");
+            } else {
+              snprintf(add_sub, sizeof(add_sub), "Hold the new card here");
+            }
+            it.printf(w / 2, 24, id(font_small), id(accent_blue),
+                      TextAlign::TOP_CENTER,
+                      guest ? "PRESENT CARD · GUEST" : "PRESENT CARD");
+            it.printf(w / 2, 42, id(font_tiny), id(text_muted),
+                      TextAlign::TOP_CENTER, "%s", add_sub);
+          }
+
+          // Slot map: one box per character of the occupancy string, filled
+          // when occupied, outlined when free, ringed when this is the slot
+          // the next card lands in. Same "X"/"-" string
+          // sensor.guardian_rfid_slot_map publishes, so what is drawn here
+          // and what process_rfid_scan treats as occupied cannot drift. Any
+          // non-'-' counts as occupied.
+          std::string map = id(ha_slot_map).has_state() ? id(ha_slot_map).state
+                                                        : std::string();
+          int nbox = (int) map.size();
+          if (nbox < 1) nbox = 0;
+          if (nbox > 9) nbox = 9;
+          const int box_w = nbox > 6 ? 16 : 22;
+          const int gap = nbox > 6 ? 4 : 8;
+          const int total = nbox * box_w + (nbox > 1 ? (nbox - 1) * gap : 0);
+          const int start = (w - total) / 2;
+          for (int i = 0; i < nbox; i++) {
+            const int bx = start + i * (box_w + gap);
+            const bool occupied = map[i] != '-';
+            const bool is_target = !target.empty() && target[0] == ('1' + i);
+            if (occupied) {
+              it.filled_rectangle(bx, 60, box_w, 20, id(col_track));
+            } else {
+              it.rectangle(bx, 60, box_w, 20, id(col_track));
+            }
+            if (is_target) {
+              it.rectangle(bx - 2, 58, box_w + 4, 24, id(col_green));
+            }
+            std::string lab = keyLabel(i);
+            char shown[8];
+            if (!lab.empty()) {
+              const int keep = nbox > 6 ? 3 : 4;
+              if ((int) lab.size() > keep) lab = lab.substr(0, keep);
+              snprintf(shown, sizeof(shown), "%s", lab.c_str());
+            } else {
+              snprintf(shown, sizeof(shown), "%d", i + 1);
+            }
+            it.printf(bx + box_w / 2, 70, id(font_tiny),
+                      occupied ? id(col_white) : id(text_muted),
+                      TextAlign::CENTER, "%s", shown);
+          }
+
+          // The way out, spelled out rather than abbreviated. Enrollment no
+          // longer switches itself off after one card - it is held open so
+          // several can be added - so the panel has to say plainly how to end
+          // it, in the words someone would actually think in. The countdown
+          // beside it is the idle expiry, which is what bounds the session if
+          // nobody does.
+          it.printf(30, 88, id(font_tiny), id(col_white), TextAlign::TOP_LEFT,
+                    "Press # to disable mode");
+          if (cd_left >= 0 && cd_label == "ENROLL") {
+            it.printf(210, 88, id(font_tiny), id(text_muted), TextAlign::TOP_RIGHT,
+                      "%d:%02d", cd_left / 60, cd_left % 60);
+          }
+          return;
+        }
+
+        // Idle rotation. Holds page 1 for eight seconds after anything happens,
+        // so it never slides out from under someone mid-read.
+        if ((uint32_t)(now_ms - id(ui_last_activity_ms)) < 8000) {
+          id(ui_page) = 0;
+          id(ui_page_ms) = now_ms;
+        } else if ((uint32_t)(now_ms - id(ui_page_ms)) > 5000) {
+          id(ui_page) = (id(ui_page) + 1) % 3;
+          id(ui_page_ms) = now_ms;
+        }
+
+        if (id(ui_page) == 1) {
+          it.printf(w / 2, 24, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                    "KEYS");
+          std::string raw = id(ha_presence_roster).has_state()
+                              ? id(ha_presence_roster).state : std::string();
+          if (raw == "unknown" || raw == "unavailable" || raw == "none") raw.clear();
+
+          struct RostRow { std::string name; std::string st; };
+          RostRow rows[9];
+          int n = 0;
+          size_t start = 0;
+          while (n < 9 && start < raw.size()) {
+            size_t sep = raw.find(';', start);
+            if (sep == std::string::npos) sep = raw.size();
+            std::string part = raw.substr(start, sep - start);
+            size_t bar = part.find('|');
+            if (bar != std::string::npos && bar > 0) {
+              rows[n].name = part.substr(0, bar);
+              rows[n].st = part.substr(bar + 1);
+              if (rows[n].name.size() > 12) rows[n].name = rows[n].name.substr(0, 12);
+              n++;
+            }
+            if (sep >= raw.size()) break;
+            start = sep + 1;
+          }
+
+          if (n == 0) {
+            it.printf(w / 2, 62, id(font_small), id(text_muted), TextAlign::CENTER,
+                      "No keys registered");
+          } else {
+            const bool two = n > 5;
+            const int per_col = 5;
+            const int row0 = 38;
+            const int pitch = 13;
+            for (int i = 0; i < n; i++) {
+              const int col = two ? (i / per_col) : 0;
+              const int row = two ? (i % per_col) : i;
+              if (two && col > 1) continue;
+              const int y = row0 + row * pitch;
+              const int nx = two ? (col == 0 ? 10 : 126) : 18;
+              const int sx = two ? (col == 0 ? 114 : 230) : 222;
+              Color sc = id(text_muted);
+              if (rows[i].st == "HOME") sc = id(col_green);
+              else if (rows[i].st == "GUEST") sc = id(accent_blue);
+              else if (rows[i].st == "LOST") sc = id(col_red);
+              it.printf(nx, y, id(font_tiny), id(col_white), TextAlign::TOP_LEFT,
+                        "%s", rows[i].name.c_str());
+              it.printf(sx, y, id(font_tiny), sc, TextAlign::TOP_RIGHT,
+                        "%s", rows[i].st.c_str());
+            }
+          }
+        } else if (id(ui_page) == 2) {
+          it.printf(w / 2, 26, id(font_tiny), id(text_muted), TextAlign::TOP_CENTER,
+                    "DIAGNOSTICS");
+          // Five rows now, tightened from four. 13 px pitch for a 10 px font,
+          // last baseline at 92 so the row bottom clears the footer rule at 106.
+          const int rows[5] = {40, 53, 66, 79, 92};
+          const bool imu_ok = id(imu_ready) &&
+                              (uint32_t)(now_ms - id(imu_last_ms)) < 500;
+
+          it.printf(18, rows[0], id(font_tiny), id(text_muted), TextAlign::TOP_LEFT, "WiFi");
+          if (id(wifi_rssi).has_state()) {
+            it.printf(222, rows[0], id(font_tiny), id(col_white), TextAlign::TOP_RIGHT,
+                      "%d dBm", (int) id(wifi_rssi).state);
+          } else {
+            it.printf(222, rows[0], id(font_tiny), id(text_muted), TextAlign::TOP_RIGHT, "n/a");
+          }
+
+          it.printf(18, rows[1], id(font_tiny), id(text_muted), TextAlign::TOP_LEFT, "Uptime");
+          if (id(portal_uptime).has_state()) {
+            const uint32_t up = (uint32_t) id(portal_uptime).state;
+            // Split into plain ints before formatting. uint32_t is
+            // "unsigned long" on this toolchain, so passing it to %u is a type
+            // mismatch even though both are 32 bits; %lu would then be wrong on
+            // targets where uint32_t is "unsigned int". Casting sidesteps both.
+            if (up >= 86400) {
+              it.printf(222, rows[1], id(font_tiny), id(col_white), TextAlign::TOP_RIGHT,
+                        "%dd %dh", (int)(up / 86400), (int)((up % 86400) / 3600));
+            } else {
+              it.printf(222, rows[1], id(font_tiny), id(col_white), TextAlign::TOP_RIGHT,
+                        "%dh %dm", (int)(up / 3600), (int)((up % 3600) / 60));
+            }
+          }
+
+          it.printf(18, rows[2], id(font_tiny), id(text_muted), TextAlign::TOP_LEFT, "Sensor");
+          it.printf(222, rows[2], id(font_tiny), imu_ok ? id(col_green) : id(col_red),
+                    TextAlign::TOP_RIGHT, imu_ok ? "OK" : "IMU FAULT");
+
+          // The doorbell in words, not just the dot in the status strip: RSSI
+          // when it is up, how long it has been gone when it is not.
+          it.printf(18, rows[3], id(font_tiny), id(text_muted), TextAlign::TOP_LEFT,
+                    "Doorbell");
+          {
+            std::string db = id(ha_doorbell_link).has_state()
+                               ? id(ha_doorbell_link).state : std::string();
+            if (db == "none" || db == "unknown" || db == "unavailable") db.clear();
+            // Same honesty rule as the status-strip dot: with our own link down
+            // this string is a cached value of unknown age, so do not colour it.
+            const Color c = !linked ? id(text_muted)
+                                    : (id(ha_doorbell_online).state ? id(col_green)
+                                                                    : id(col_red));
+            it.printf(222, rows[3], id(font_tiny), c, TextAlign::TOP_RIGHT,
+                      "%s", db.empty() ? "-" : db.c_str());
+          }
+
+          it.printf(18, rows[4], id(font_tiny), id(text_muted), TextAlign::TOP_LEFT, "Last door");
+          std::string last = id(ha_last_door).has_state() ? id(ha_last_door).state
+                                                          : std::string();
+          if (last == "none" || last == "unknown" || last == "unavailable") last.clear();
+          it.printf(222, rows[4], id(font_tiny), id(col_white), TextAlign::TOP_RIGHT,
+                    "%s", last.empty() ? "-" : last.c_str());
+        } else {
+          headline("SYSTEM ARMED", id(col_white),
+                   door_open ? "Door is open" : "Ready for Input",
+                   door_open ? id(col_amber) : id(text_muted));
+        }
+        return;
+      }
+
+      // Anything the firmware does not recognise. Previously this fell through
+      // every branch and left the middle of the screen blank.
+      headline("STANDBY", id(text_muted), st.c_str(), id(col_white));

@@ -1,0 +1,324 @@
+# Local component: esphome/components/guardian_rfid. Path is relative to this
+# file. Must stay in lockstep with portal-unit.yaml — both devices share the
+# HMAC master key and the on-card layout.
+external_components:
+  - source:
+      type: local
+      path: components
+
+esphome:
+  name: doorbell-unit
+  friendly_name: Smart Doorbell
+  comment: "ESP32-C6 RFID smart doorbell"
+
+esp32:
+  board: seeed_xiao_esp32c6
+  variant: esp32c6
+  framework:
+    type: esp-idf
+    # FLASH ENCRYPTION AND SECURE BOOT ARE OFF ON PURPOSE.
+    #
+    # guardian_rfid_mac_key compiles into this firmware in cleartext. This
+    # device is mounted outside the door. Enabling flash encryption or secure
+    # boot burns eFuses and is irreversible. The XIAO ESP32-C6 logs over USB
+    # Serial JTAG; a download-disable eFuse can brick USB recovery. The first
+    # encrypted image MUST go over USB, never OTA. See INSTALL.md § Flash
+    # encryption. Do not uncomment this and hope.
+    #
+    # sdkconfig_options:
+    #   CONFIG_SECURE_FLASH_ENC_ENABLED: y
+    #   CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT: y
+    # Secure boot is a separate one-way eFuse. Do not enable it until
+    # development-mode flash encryption has been proven on THIS board over
+    # USB, then OTA.
+    #   CONFIG_SECURE_BOOT: y
+    #   CONFIG_SECURE_BOOT_V2_ENABLED: y
+
+# Logs are available through the XIAO ESP32-C6 USB-C connection.
+#
+# INFO, not DEBUG. Every log line is also pushed to each connected API client,
+# and this device sits at roughly -87 dBm with a 768-byte task log buffer, so at
+# DEBUG the buffer is saturated by routine chatter and drains slowly over the
+# same marginal link the door events depend on. That is why log lines arrived
+# seconds after the event that produced them and appeared out of order - the
+# reader was not slow, its log was.
+#
+# The portal was moved to INFO for this reason in an earlier pass; the doorbell
+# was missed. Raise it temporarily when actually debugging.
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: INFO
+  # ESPHome will not let a per-tag "logs:" entry be MORE verbose than this
+  # global level, so the guardian_rfid REQA/SELECT trace lines (DEBUG) are
+  # invisible at INFO. To see them, temporarily change level above to DEBUG,
+  # reflash, capture the tap, then set it back to INFO before normal use.
+
+# Home Assistant native API.
+api:
+  encryption:
+    key: !secret doorbell_unit__encryption_key
+  # Stated rather than inherited. ESPHome's default is 15min, and a default
+  # nobody wrote down is not a decision - the portal had the same gap and it
+  # would have switched the offline siren off a quarter of an hour into every
+  # outage.
+  #
+  # 15min is KEPT here, unlike the portal, and the difference is the point. This
+  # device has no authority of its own: no reed switch, no siren, no globals,
+  # nothing it decides alone. Rebooting it during an outage costs nothing and
+  # recovers a wedged network stack, which is exactly what the timeout is for.
+  # The portal sets 0s only because a reboot there destroys the RAM its offline
+  # authority lives in.
+  reboot_timeout: 15min
+
+  # Green LED indicates that Home Assistant connected successfully.
+  on_client_connected:
+    then:
+      - light.turn_on:
+          id: doorbell_led
+          red: 0%
+          green: 100%
+          blue: 0%
+      - delay: 5s
+      - light.turn_off: doorbell_led
+
+# Native ESPHome OTA updates.
+ota:
+  - platform: esphome
+    password: !secret doorbell_unit__ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Improves reliability at the cost of slightly higher power consumption.
+  # Appropriate here because the doorbell is permanently powered.
+  power_save_mode: none
+
+  # Scan normally so the ESP32 can select the strongest access point when
+  # multiple access points use the same SSID.
+  fast_connect: false
+
+  # Restart and retry if Wi-Fi remains unavailable for an extended period.
+  reboot_timeout: 15min
+
+  # Reach this device by IP address instead of by mDNS name.
+  #
+  # This is a connectivity fix, not a cosmetic one. Without use_address, Home
+  # Assistant and the ESPHome dashboard find the doorbell as "doorbell-unit"
+  # over mDNS, which is multicast. A managed switch with IGMP snooping enabled
+  # and no querier on the segment prunes exactly that traffic, and the symptom
+  # is precisely what was reported after the switch upgrade: the device shows as
+  # "State Unknown", comes and goes, and does so independently of the interior
+  # portal - which was never affected, because the portal has always had a
+  # use_address and therefore never needed name resolution at all.
+  #
+  # Set doorbell_unit__ip in secrets.yaml to the address reserved for this
+  # device in the router's DHCP table. It is a new key: the build will fail
+  # loudly until it exists, which is deliberate. A silently wrong address here
+  # would be far harder to diagnose than a build error, and this file is flashed
+  # to hardware that is inconvenient to reach.
+  #
+  # There is still no manual_ip block. The router hands out the address via a
+  # DHCP reservation; this only tells Home Assistant where to look for it.
+  use_address: !secret doorbell_unit__ip
+
+  ap:
+    # Left inline. The portal reads the equivalent value from secrets.yaml, but
+    # matching that here would mean adding a new key. A fallback AP name is not
+    # sensitive; genericise it before publishing if you prefer.
+    ssid: Doorbell Fallback
+    password: !secret doorbell_unit__fallback_password
+    ap_timeout: 1min
+
+  # Red LED indicates loss of Wi-Fi.
+  on_disconnect:
+    then:
+      - light.turn_on:
+          id: doorbell_led
+          red: 100%
+          green: 0%
+          blue: 0%
+
+  # Turn the red LED off once Wi-Fi reconnects. The API connection automation
+  # will subsequently flash it green when Home Assistant connects.
+  on_connect:
+    then:
+      - light.turn_off: doorbell_led
+
+captive_portal:
+
+# RFID reader bus.
+i2c:
+  sda: GPIO22
+  scl: GPIO23
+  scan: true
+  frequency: 100kHz
+
+# Imported so this reader can enroll. Without it a doorbell tap during an
+# enrollment session would only ever emit bad_mac / unsupported_tag.
+binary_sensor:
+  - platform: homeassistant
+    id: ha_enrollment_mode
+    entity_id: input_boolean.guardian_enrollment_mode
+    internal: true
+
+  # Canonical "is this device talking to Home Assistant" signal. The doorbell
+  # previously exposed nothing of the kind, so the only way to tell it had
+  # dropped off the network was to notice that its WiFi-signal sensor had gone
+  # unavailable - a proxy with up to 30s of lag that nothing alerted on.
+  #
+  # Home Assistant treats this entity specially: unlike every other entity on
+  # the device, it stays available when the device disconnects and flips to off.
+  # That is what makes it usable as an input to a template and to the portal's
+  # link indicator, where "unavailable" would just have propagated the problem.
+  - platform: status
+    name: "Doorbell Link"
+    id: doorbell_link
+
+  # Physical doorbell button.
+  - platform: gpio
+    id: doorbell_button
+    name: "Doorbell Button"
+    pin:
+      number: GPIO21
+      inverted: true
+      mode:
+        input: true
+        # `inverted: true` declares this active-LOW, which only makes sense with
+        # a pull-up holding it HIGH at rest - and there was none configured
+        # here. It worked because the custom doorbell PCB carries an external
+        # pull-up for the button, so the dependency was real, invisible, and
+        # documented in a 14 MB Word file that nothing referenced.
+        #
+        # Enabled explicitly so the firmware is self-sufficient: on the PCB the
+        # internal ~45k sits in parallel with the external 10 kΩ (KiCad R4,
+        # silkscreen `10K Ohm`) and changes nothing measurable, and on a bare
+        # XIAO with a button soldered straight to the pin the input no longer
+        # floats and produce phantom presses. The portal's reed switch has
+        # always said INPUT_PULLUP for the same reason.
+        #
+        # Either 10 kΩ or 1 kΩ dominates the internal pull-up; solder 10 kΩ so
+        # the board matches the silkscreen. See docs/documentation/doorbell/.
+        pullup: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_press:
+      then:
+        - homeassistant.event:
+            event: esphome.doorbell_pressed
+            data:
+              source: "doorbell"
+
+# 250ms rather than 1s: detection delay only, crypto still runs inside the
+# same tap. Outdoor taps were sluggish at a one-second poll.
+guardian_rfid:
+  id: guardian_reader
+  address: 0x28
+  update_interval: 250ms
+  source: doorbell
+  master_key: !secret guardian_rfid_mac_key
+  enrollment: ha_enrollment_mode
+  on_scan:
+    then:
+      - lambda: |-
+          ESP_LOGI("guardian",
+                   "RFID scan (doorbell): result=%s card_id=%s counter=%u rotated=%s",
+                   id(guardian_reader).result().c_str(),
+                   id(guardian_reader).card_id_hex().c_str(),
+                   (unsigned) id(guardian_reader).counter(),
+                   id(guardian_reader).rotated() ? "true" : "false");
+      - homeassistant.event:
+          event: esphome.rfid_scanned
+          data:
+            source: doorbell
+            result: !lambda "return id(guardian_reader).result();"
+            card_id: !lambda "return id(guardian_reader).card_id_hex();"
+            counter: !lambda "return std::to_string(id(guardian_reader).counter());"
+            rotated: !lambda "return std::string(id(guardian_reader).rotated() ? \"true\" : \"false\");"
+            uid_bytes: !lambda "return std::to_string(id(guardian_reader).uid_bytes());"
+            # "false" means this card's payload is readable by ANY reader - an
+            # NTAG with no password set, or a Classic still on the published
+            # transport key. The credential is a bearer token, so a readable
+            # card is a clonable card. The reader used to discard this and treat
+            # a protected and an unprotected tag identically.
+            protected: !lambda "return std::string(id(guardian_reader).tag_protected() ? \"true\" : \"false\");"
+  on_tag_removed:
+    then:
+      - logger.log:
+          level: INFO
+          format: "RFID tag removed (doorbell)"
+
+# Onboard RGB LED PWM outputs.
+output:
+  - platform: ledc
+    id: led_red_output
+    pin:
+      number: GPIO0
+      inverted: false
+
+  - platform: ledc
+    id: led_green_output
+    pin:
+      number: GPIO1
+      inverted: false
+
+  - platform: ledc
+    id: led_blue_output
+    pin:
+      number: GPIO2
+      inverted: false
+
+light:
+  - platform: rgb
+    id: doorbell_led
+    name: "Doorbell Status Light"
+    red: led_red_output
+    green: led_green_output
+    blue: led_blue_output
+    restore_mode: ALWAYS_OFF
+
+# Connection and troubleshooting sensors.
+sensor:
+  - platform: wifi_signal
+    name: "Doorbell WiFi Signal"
+    id: doorbell_wifi_signal
+    update_interval: 30s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Doorbell Uptime"
+    id: doorbell_uptime
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "Doorbell IP Address"
+      entity_category: diagnostic
+
+    ssid:
+      name: "Doorbell Connected SSID"
+      entity_category: diagnostic
+
+    bssid:
+      name: "Doorbell Connected BSSID"
+      entity_category: diagnostic
+
+    mac_address:
+      name: "Doorbell WiFi MAC Address"
+      entity_category: diagnostic
+
+    dns_address:
+      name: "Doorbell DNS Address"
+      entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Doorbell Restart"
+    entity_category: diagnostic
+
+  - platform: safe_mode
+    name: "Doorbell Restart in Safe Mode"
+    entity_category: diagnostic

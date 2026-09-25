@@ -1,0 +1,1026 @@
+# RFID slot helpers, occupancy sensors, and the slot-id whitelist.
+#
+# The key rack is pre-declared at the keypad cap of 9 (one digit, ENROLL_DUP
+# encodes the slot as a single character). After the portal firmware that
+# reads sensor.guardian_rfid_slot_map.length() is flashed once, add/remove is
+# enroll / guardian_clear_rfid_slot from the Guardian panel — no YAML edit
+# and no second flash. Empty positions are free slots, not residents:
+# occupancy readers skip any id whose card_id is not 16 lowercase hex.
+#
+# Do not leave a whitelist id without helpers: process_rfid_scan would try to
+# write a missing entity. Do not leave helpers without a whitelist id: a
+# leftover card_id would still match.
+#
+# These helpers used to be created by hand in Settings -> Helpers. Declaring
+# them here is what makes max: 64 a guarantee rather than a DEPLOY.md warning,
+# and what makes a visitor policy exist at all. On an existing install the UI
+# helpers MUST be deleted before this package is deployed, or Home Assistant
+# will refuse the colliding entity ids. See DEPLOY.md (ninth pass).
+
+input_boolean:
+  # Session flag for enrollment, not a per-slot setting. Press 0 on the portal
+  # keypad while enrollment is on to toggle it; the next card (or a tap of an
+  # already-registered card) is recorded as a visitor. Cleared whenever
+  # enrollment mode turns on or off, so a leftover press cannot silently mark
+  # tomorrow's resident card as a guest.
+  guardian_enroll_as_visitor:
+    name: Guardian Enroll As Visitor
+    icon: mdi:account-clock-outline
+    initial: false
+
+# YAML input_text / input_select with `initial:` skip restore on every Home
+# Assistant start (the value is applied instead). That is what made enrolled
+# cards vanish after a restart: initial: '' wiped the hashes, occupancy went
+# to ----, and the next tap was DENIED_CARD. Stolen/Lost and visitor would
+# have reset the same way (stolen card grants again; visitor counts as home).
+#
+# Do not put initial: on credential or name helpers. Occupancy already treats
+# anything that is not a 16-character hex card_id after trim/lower — '',
+# unknown, truncated — as empty, so a first-boot unset card_id is a free slot.
+# Enrollment always writes presence and policy. guardian_enroll_as_visitor
+# and guardian_enroll_pending_name keep initial: because a leftover guest
+# flag or name after a restart is a session leak, not a credential.
+#
+# rfid_N_hash is no longer the credential. It stays so a leftover UI helper
+# id does not collide, and so guardian_clear_rfid_slot can still wipe a UID
+# digest that would otherwise remain a cloning oracle (F-20). Occupancy and
+# matching read rfid_N_card_id. Person names live on rfid_N_name; the
+# input_select friendly_name stays "RFID N" for the helper id.
+input_text:
+  guardian_enroll_pending_name:
+    name: Guardian Enroll Pending Name
+    icon: mdi:account-edit-outline
+    max: 32
+    initial: ''
+  # Whether each enrolled card's payload is password-protected ON THE CARD, as
+  # last reported by a reader. Written only by process_rfid_scan, read only by
+  # the panel's key list. It gates nothing.
+  #
+  # FORMAT: comma-separated `<slot><flag>`, flag `p` for protected and `u` for
+  # unprotected - "1p,3u,4p". Nine slots is at most 27 characters.
+  #
+  # A PAIR LIST RATHER THAN A PLAIN LIST OF UNPROTECTED IDS, and that is the
+  # whole design. A bare list has two states and this has three: protected,
+  # unprotected, and NEVER REPORTED. Absence from a bare list would mean "safe"
+  # and "nobody has ever looked" at the same time, and the second is the state
+  # every key in this house is actually in - both devices on this door run
+  # firmware older than the field, so they say nothing on every scan. Drawing
+  # that as "protected" would tell a household their keys had been checked and
+  # passed, which is the one thing this must not do.
+  #
+  # NO initial:, deliberately, and for the opposite reason to most helpers here.
+  # `initial:` is applied on every start and skips restore_state, so a helper
+  # that declares one cannot carry anything across a restart. This holds a
+  # finding about physical cards; it does not stop being true because Home
+  # Assistant restarted, and re-deriving it would mean waiting for every key in
+  # the house to be tapped again.
+  guardian_card_protection:
+    name: Guardian Card Protection
+    icon: mdi:shield-key-outline
+    max: 64
+  rfid_1_hash:
+    name: RFID 1 Hash
+    max: 64
+    mode: password
+  rfid_2_hash:
+    name: RFID 2 Hash
+    max: 64
+    mode: password
+  rfid_3_hash:
+    name: RFID 3 Hash
+    max: 64
+    mode: password
+  rfid_4_hash:
+    name: RFID 4 Hash
+    max: 64
+    mode: password
+  rfid_5_hash:
+    name: RFID 5 Hash
+    max: 64
+    mode: password
+  rfid_6_hash:
+    name: RFID 6 Hash
+    max: 64
+    mode: password
+  rfid_7_hash:
+    name: RFID 7 Hash
+    max: 64
+    mode: password
+  rfid_8_hash:
+    name: RFID 8 Hash
+    max: 64
+    mode: password
+  rfid_9_hash:
+    name: RFID 9 Hash
+    max: 64
+    mode: password
+  rfid_1_card_id:
+    name: RFID 1 Card ID
+    max: 16
+    mode: password
+  rfid_2_card_id:
+    name: RFID 2 Card ID
+    max: 16
+    mode: password
+  rfid_3_card_id:
+    name: RFID 3 Card ID
+    max: 16
+    mode: password
+  rfid_4_card_id:
+    name: RFID 4 Card ID
+    max: 16
+    mode: password
+  rfid_5_card_id:
+    name: RFID 5 Card ID
+    max: 16
+    mode: password
+  rfid_6_card_id:
+    name: RFID 6 Card ID
+    max: 16
+    mode: password
+  rfid_7_card_id:
+    name: RFID 7 Card ID
+    max: 16
+    mode: password
+  rfid_8_card_id:
+    name: RFID 8 Card ID
+    max: 16
+    mode: password
+  rfid_9_card_id:
+    name: RFID 9 Card ID
+    max: 16
+    mode: password
+  rfid_1_name:
+    name: RFID 1 Name
+    max: 32
+  rfid_2_name:
+    name: RFID 2 Name
+    max: 32
+  rfid_3_name:
+    name: RFID 3 Name
+    max: 32
+  rfid_4_name:
+    name: RFID 4 Name
+    max: 32
+  rfid_5_name:
+    name: RFID 5 Name
+    max: 32
+  rfid_6_name:
+    name: RFID 6 Name
+    max: 32
+  rfid_7_name:
+    name: RFID 7 Name
+    max: 32
+  rfid_8_name:
+    name: RFID 8 Name
+    max: 32
+  rfid_9_name:
+    name: RFID 9 Name
+    max: 32
+  # Restore-safe mirror of input_select.rfid_N_notify_target. The select's
+  # YAML options are only `none`, so Home Assistant rejects restoring a
+  # previously selected phone on every start. These have no initial:, so
+  # they restore. script.guardian_refresh_notify_target_options copies the
+  # saved value back onto the select after rebuilding the options list.
+  rfid_1_notify_saved:
+    name: RFID 1 Notify Saved
+    max: 100
+  rfid_2_notify_saved:
+    name: RFID 2 Notify Saved
+    max: 100
+  rfid_3_notify_saved:
+    name: RFID 3 Notify Saved
+    max: 100
+  rfid_4_notify_saved:
+    name: RFID 4 Notify Saved
+    max: 100
+  rfid_5_notify_saved:
+    name: RFID 5 Notify Saved
+    max: 100
+  rfid_6_notify_saved:
+    name: RFID 6 Notify Saved
+    max: 100
+  rfid_7_notify_saved:
+    name: RFID 7 Notify Saved
+    max: 100
+  rfid_8_notify_saved:
+    name: RFID 8 Notify Saved
+    max: 100
+  rfid_9_notify_saved:
+    name: RFID 9 Notify Saved
+    max: 100
+  # Per-person notification preferences, half two: the muted-category list.
+  # A comma-separated set of category tokens this person does NOT want, drawn
+  # from the closed six: mine, security, access, presence, camera, system.
+  #
+  # Empty is the default and means nothing is muted - all six on. That matters
+  # for more than tidiness: an unset helper, a helper wiped by a bad restore,
+  # and a person who has muted nothing must all read the same, and they must
+  # all read as "send it". A preference store whose failure mode is silence is
+  # the wrong way round on a security system. The reader in scripts.yaml treats
+  # any unparseable value as empty for exactly that reason.
+  #
+  # No initial:, so it restores (see the note above input_text). max: 60 fits
+  # all six tokens joined with commas (44 characters) with room to spare; the
+  # tokens are a closed set, so this can never grow unbounded.
+  rfid_1_notify_mute:
+    name: RFID 1 Notify Mute
+    max: 60
+  rfid_2_notify_mute:
+    name: RFID 2 Notify Mute
+    max: 60
+  rfid_3_notify_mute:
+    name: RFID 3 Notify Mute
+    max: 60
+  rfid_4_notify_mute:
+    name: RFID 4 Notify Mute
+    max: 60
+  rfid_5_notify_mute:
+    name: RFID 5 Notify Mute
+    max: 60
+  rfid_6_notify_mute:
+    name: RFID 6 Notify Mute
+    max: 60
+  rfid_7_notify_mute:
+    name: RFID 7 Notify Mute
+    max: 60
+  rfid_8_notify_mute:
+    name: RFID 8 Notify Mute
+    max: 60
+  rfid_9_notify_mute:
+    name: RFID 9 Notify Mute
+    max: 60
+  # Home Assistant user id bound to this key slot. Empty = unassigned.
+  # This is permission, not notification routing: the slot is still the
+  # person, and rfid_N_notify_target is still the phone. No initial:, so a
+  # restart cannot unlink someone. max: 64 holds a UUID without dashes.
+  rfid_1_ha_user_id:
+    name: RFID 1 HA User
+    max: 64
+  rfid_2_ha_user_id:
+    name: RFID 2 HA User
+    max: 64
+  rfid_3_ha_user_id:
+    name: RFID 3 HA User
+    max: 64
+  rfid_4_ha_user_id:
+    name: RFID 4 HA User
+    max: 64
+  rfid_5_ha_user_id:
+    name: RFID 5 HA User
+    max: 64
+  rfid_6_ha_user_id:
+    name: RFID 6 HA User
+    max: 64
+  rfid_7_ha_user_id:
+    name: RFID 7 HA User
+    max: 64
+  rfid_8_ha_user_id:
+    name: RFID 8 HA User
+    max: 64
+  rfid_9_ha_user_id:
+    name: RFID 9 HA User
+    max: 64
+
+# Last accepted rolling counter per slot. Shared by both readers. No initial:
+# so a restart does not rewind the window and flag a real key as a clone.
+input_number:
+  rfid_1_counter:
+    name: RFID 1 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_2_counter:
+    name: RFID 2 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_3_counter:
+    name: RFID 3 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_4_counter:
+    name: RFID 4 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_5_counter:
+    name: RFID 5 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_6_counter:
+    name: RFID 6 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_7_counter:
+    name: RFID 7 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_8_counter:
+    name: RFID 8 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+  rfid_9_counter:
+    name: RFID 9 Counter
+    min: 0
+    max: 2147483647
+    step: 1
+    mode: box
+
+input_select:
+  rfid_1:
+    name: RFID 1
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_2:
+    name: RFID 2
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_3:
+    name: RFID 3
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_4:
+    name: RFID 4
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_5:
+    name: RFID 5
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_6:
+    name: RFID 6
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_7:
+    name: RFID 7
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_8:
+    name: RFID 8
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  rfid_9:
+    name: RFID 9
+    icon: mdi:home-account
+    options:
+      - Away
+      - At home
+      - Stolen/Lost
+  # Policy is not presence. A visitor key still opens the door, still answers
+  # MFA and entry challenges, and can still be flagged Stolen/Lost. It is
+  # never treated as an occupant: presence stays Away, and occupancy readers
+  # (house_empty, Frigate, the portal roster) skip it.
+  rfid_1_policy:
+    name: RFID 1 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_2_policy:
+    name: RFID 2 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_3_policy:
+    name: RFID 3 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_4_policy:
+    name: RFID 4 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_5_policy:
+    name: RFID 5 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_6_policy:
+    name: RFID 6 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_7_policy:
+    name: RFID 7 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_8_policy:
+    name: RFID 8 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  rfid_9_policy:
+    name: RFID 9 Policy
+    icon: mdi:badge-account-horizontal
+    options:
+      - resident
+      - visitor
+  # Closed-set phone picker per slot. YAML options are only `none`; a companion
+  # automation copies currently-registered mobile_app notify object ids onto
+  # these selects at runtime. A select cannot hold a value that is not in its
+  # own options list, so a later notify.{{ x }} cannot be an arbitrary typed
+  # string. The selected object id is mirrored to rfid_N_notify_saved (no
+  # initial:) so a restart can re-apply it after the options list is rebuilt.
+  rfid_1_notify_target:
+    name: "RFID 1 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_2_notify_target:
+    name: "RFID 2 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_3_notify_target:
+    name: "RFID 3 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_4_notify_target:
+    name: "RFID 4 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_5_notify_target:
+    name: "RFID 5 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_6_notify_target:
+    name: "RFID 6 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_7_notify_target:
+    name: "RFID 7 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_8_notify_target:
+    name: "RFID 8 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  rfid_9_notify_target:
+    name: "RFID 9 Notify Target"
+    icon: mdi:cellphone-message
+    options:
+      - none
+  # Per-person notification preferences, half one: the severity floor.
+  #
+  # Unlike rfid_N_notify_target above, the options here are STATIC - a closed
+  # set of four words that cannot depend on what hardware is registered. That
+  # single difference removes the whole apparatus that surrounds the phone
+  # picker: no runtime set_options, no rfid_N_notify_level_saved mirror, no
+  # refresh script. Home Assistant restores the chosen option by itself,
+  # because the option it is restoring is always still in the list.
+  #
+  # Important is listed FIRST on purpose, and it is the only reason the order
+  # is not the obvious loudest-to-quietest. A helper that has never been set
+  # comes up on its first option, and Important is the default a new key
+  # should have: everything the household actually needs, minus the routine
+  # chatter. Encoding the default as position is what lets these have no
+  # initial: (so they restore) while still defaulting correctly on a fresh
+  # install - the alternative, initial: Important, would silently reset every
+  # person's choice on every restart, which is precisely the bug documented at
+  # the top of the input_text block.
+  #
+  # The panel does not render this order. guardian-panel.js draws its own
+  # segmented control in reading order (Everything, Important, Urgent only,
+  # Off); this list is only ever seen in Developer Tools.
+  #
+  # Meaning of each, as enforced by guardian_notify_person / _broadcast:
+  #   Everything   routine and above - every tagged alert
+  #   Important    important and above (default)
+  #   Urgent only  urgent only
+  #   Off          nothing, EXCEPT alerts sent with nonmaskable: true (major
+  #                alarm, stolen card). Off is not a way to turn the burglar
+  #                alarm off, and the panel says so.
+  #
+  # Unrolled, not a YAML anchor, to match every other rack in this file. The
+  # nine option lists are identical and an anchor would say so more tersely,
+  # but nothing else here is written that way and one clever block is how the
+  # next person learns to distrust the other eight.
+  rfid_1_notify_level:
+    name: "RFID 1 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_2_notify_level:
+    name: "RFID 2 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_3_notify_level:
+    name: "RFID 3 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_4_notify_level:
+    name: "RFID 4 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_5_notify_level:
+    name: "RFID 5 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_6_notify_level:
+    name: "RFID 6 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_7_notify_level:
+    name: "RFID 7 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_8_notify_level:
+    name: "RFID 8 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+  rfid_9_notify_level:
+    name: "RFID 9 Notify Level"
+    icon: mdi:bell-cog
+    options:
+      - Important
+      - Everything
+      - Urgent only
+      - Off
+
+template:
+  - sensor:
+      # THE runtime whitelist. Scripts and automations loop this instead of
+      # range(1, 5) or ['1','2','3','4']. Occupancy sensors below also loop it;
+      # they are trigger-based so a Jinja-built entity id is legal (the
+      # listener extractor never sees those templates).
+      #
+      # Static on purpose: a template that listed the hash helpers here would
+      # be a fourth copy of the slot list. The keypad cap is 9, so the
+      # whitelist is the full rack; empty positions are free slots, not people.
+      - name: Guardian RFID Slots
+        unique_id: guardian_rfid_slots
+        icon: mdi:card-account-details-outline
+        state: '1,2,3,4,5,6,7,8,9'
+        attributes:
+          count: >-
+            {{ (this.state | string).split(',') | map('trim')
+               | reject('eq', '') | list | count }}
+
+  # Trigger-based so the state templates can loop. Home Assistant's listener
+  # extractor only sees a complete quoted entity id; building
+  # 'input_text.rfid_' ~ i ~ '_card_id' inside a normal template sensor is how the
+  # portal enrollment screen announced ALL SLOTS FULL on an empty house
+  # (DEPLOY.md fifth pass). The trigger entity_id list is the remaining unroll,
+  # sitting next to the helper declarations above.
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+      - trigger: state
+        entity_id:
+          - input_text.rfid_1_card_id
+          - input_text.rfid_2_card_id
+          - input_text.rfid_3_card_id
+          - input_text.rfid_4_card_id
+          - input_text.rfid_5_card_id
+          - input_text.rfid_6_card_id
+          - input_text.rfid_7_card_id
+          - input_text.rfid_8_card_id
+          - input_text.rfid_9_card_id
+          - input_text.rfid_1_hash
+          - input_text.rfid_2_hash
+          - input_text.rfid_3_hash
+          - input_text.rfid_4_hash
+          - input_text.rfid_5_hash
+          - input_text.rfid_6_hash
+          - input_text.rfid_7_hash
+          - input_text.rfid_8_hash
+          - input_text.rfid_9_hash
+          - input_text.rfid_1_name
+          - input_text.rfid_2_name
+          - input_text.rfid_3_name
+          - input_text.rfid_4_name
+          - input_text.rfid_5_name
+          - input_text.rfid_6_name
+          - input_text.rfid_7_name
+          - input_text.rfid_8_name
+          - input_text.rfid_9_name
+          - input_text.guardian_enrollment_slot
+          - input_select.rfid_1
+          - input_select.rfid_2
+          - input_select.rfid_3
+          - input_select.rfid_4
+          - input_select.rfid_5
+          - input_select.rfid_6
+          - input_select.rfid_7
+          - input_select.rfid_8
+          - input_select.rfid_9
+          - input_select.rfid_1_policy
+          - input_select.rfid_2_policy
+          - input_select.rfid_3_policy
+          - input_select.rfid_4_policy
+          - input_select.rfid_5_policy
+          - input_select.rfid_6_policy
+          - input_select.rfid_7_policy
+          - input_select.rfid_8_policy
+          - input_select.rfid_9_policy
+    sensor:
+      # How many slots hold no well-formed card_id. Same "not 16 hex characters
+      # after trim/lower" rule process_rfid_scan uses to pick a slot.
+      - name: Guardian RFID Free Slots
+        unique_id: guardian_rfid_free_slots
+        icon: mdi:card-multiple-outline
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(n=0) %}
+          {% for i in slots %}
+            {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                       | string | trim | lower %}
+            {% if not (c | length == 16 and c is match('^[0-9a-f]{16}$')) %}
+              {% set ns.n = ns.n + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.n }}
+
+      # One character per slot: "X" occupied, "-" free. The portal draws this
+      # string's length as the box count, so the firmware does not have a
+      # compiled slot count of its own.
+      - name: Guardian RFID Slot Map
+        unique_id: guardian_rfid_slot_map
+        icon: mdi:view-grid-outline
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(s='') %}
+          {% for i in slots %}
+            {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                       | string | trim | lower %}
+            {% set ns.s = ns.s ~ ('X' if c | length == 16 and c is match('^[0-9a-f]{16}$') else '-') %}
+          {% endfor %}
+          {{ ns.s }}
+
+      # Keypad choice if it is a real slot id, otherwise the first free slot,
+      # "none" when every slot is occupied and nothing has been chosen.
+      - name: Guardian Enrollment Target Slot
+        unique_id: guardian_enrollment_target_slot
+        icon: mdi:card-plus-outline
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set chosen = states('input_text.guardian_enrollment_slot')
+                          | string | trim %}
+          {% if chosen in slots %}{{ chosen }}
+          {%- else %}
+            {% set ns = namespace(slot='none') %}
+            {% for i in slots %}
+              {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                         | string | trim | lower %}
+              {% if ns.slot == 'none' and not (c | length == 16 and c is match('^[0-9a-f]{16}$')) %}
+                {% set ns.slot = i %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.slot }}
+          {%- endif %}
+
+      # Occupied resident slots only. Empty rack positions and visitors are
+      # not occupants; they must not turn "2/2 home" into "2/9 home".
+      - name: Guardian Presence Summary
+        unique_id: guardian_presence_summary
+        icon: mdi:home-account
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(home=[], total=0) %}
+          {% for i in slots %}
+            {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                       | string | trim | lower %}
+            {% set occupied = c | length == 16 and c is match('^[0-9a-f]{16}$') %}
+            {% if occupied and states('input_select.rfid_' ~ i ~ '_policy') != 'visitor' %}
+              {% set s = 'input_select.rfid_' ~ i %}
+              {% if states(s) not in ['unavailable', 'unknown'] %}
+                {% set ns.total = ns.total + 1 %}
+                {% if states(s) == 'At home' %}
+                  {% set raw = states('input_text.rfid_' ~ i ~ '_name')
+                     | string | trim %}
+                  {% set label = raw if raw not in ['', 'unknown', 'unavailable']
+                     else 'Key ' ~ i %}
+                  {% set ns.home = ns.home + [label.split(' ') | first] %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.home | length }}/{{ ns.total }} home{% if ns.home %} · {{ ns.home
+          | join(', ') }}{% endif %}
+
+      # Packed roster for the portal idle page: "Anton|HOME;Sam|AWAY;Maria|GUEST".
+      # Firmware splits on ';' / '|' and never draws those separators (the
+      # glyph set has no '|'). Occupied keys only, visitors included, first
+      # word of the name, 12 characters. Empty string means no keys.
+      - name: Guardian Presence Roster
+        unique_id: guardian_presence_roster
+        icon: mdi:account-group-outline
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(rows=[]) %}
+          {% for i in slots %}
+            {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                       | string | trim | lower %}
+            {% set occupied = c | length == 16 and c is match('^[0-9a-f]{16}$') %}
+            {% if occupied %}
+              {% set raw = states('input_text.rfid_' ~ i ~ '_name')
+                 | string | trim %}
+              {% set label = raw if raw not in ['', 'unknown', 'unavailable']
+                 else 'Key ' ~ i %}
+              {% set label = (label.split(' ') | first)
+                 | replace('|', '') | replace(';', '') %}
+              {% set label = label[:12] %}
+              {% set pol = states('input_select.rfid_' ~ i ~ '_policy') %}
+              {% set pres = states('input_select.rfid_' ~ i) %}
+              {% if pres in ['Stolen', 'Stolen/Lost'] %}
+                {% set st = 'LOST' %}
+              {% elif pol == 'visitor' %}
+                {% set st = 'GUEST' %}
+              {% elif pres == 'At home' %}
+                {% set st = 'HOME' %}
+              {% else %}
+                {% set st = 'AWAY' %}
+              {% endif %}
+              {% set ns.rows = ns.rows + [label ~ '|' ~ st] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.rows | join(';') }}
+
+      # Same whitelist order as the slot map. Occupied names (first word,
+      # 8 characters); "-" when empty. The portal enrollment boxes and
+      # ENROLL_DUP read this so the keypad still uses 1-9 while the
+      # labels are people.
+      - name: Guardian RFID Key Labels
+        unique_id: guardian_rfid_key_labels
+        icon: mdi:card-account-details-outline
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(rows=[]) %}
+          {% for i in slots %}
+            {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                       | string | trim | lower %}
+            {% set occupied = c | length == 16 and c is match('^[0-9a-f]{16}$') %}
+            {% if occupied %}
+              {% set raw = states('input_text.rfid_' ~ i ~ '_name')
+                 | string | trim %}
+              {% set label = raw if raw not in ['', 'unknown', 'unavailable']
+                 else 'Key' ~ i %}
+              {% set label = (label.split(' ') | first)
+                 | replace('|', '') | replace(';', '') %}
+              {% set ns.rows = ns.rows + [label[:8]] %}
+            {% else %}
+              {% set ns.rows = ns.rows + ['-'] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.rows | join(';') }}
+
+  # Who has changed their notification preferences away from the default, and
+  # what to. DIAGNOSTICS ONLY.
+  #
+  # Read this twice: nothing on the delivery path may depend on this sensor.
+  # guardian_notify_person and guardian_notify_broadcast read
+  # input_select.rfid_N_notify_level and input_text.rfid_N_notify_mute
+  # DIRECTLY, in the same slot loop they already use for the phone picker. That
+  # is deliberate and it is the whole lesson of the note further down this file:
+  # a trigger-based sensor renders `unknown` after a template reload, and the
+  # last time an alert path trusted one, every mapped alert in the house was
+  # silently skipped with a phone plainly selected in the panel. A preferences
+  # sensor that went `unknown` would do something worse - it would make every
+  # person look like they had opted out of everything.
+  #
+  # Trigger-based because the state template loops the rack to build entity
+  # ids, which a plain state template may not do (see the listener-extractor
+  # note above sensor.guardian RFID Free Slots). That is exactly the property
+  # that disqualifies it from the delivery path, and it is fine here: the panel
+  # reads the helpers directly too, and this exists for Developer Tools, for
+  # the Diagnostics page, and for answering "why did Sam not get that?" without
+  # opening nine helpers by hand.
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+      - trigger: state
+        entity_id:
+          - input_select.rfid_1_notify_level
+          - input_select.rfid_2_notify_level
+          - input_select.rfid_3_notify_level
+          - input_select.rfid_4_notify_level
+          - input_select.rfid_5_notify_level
+          - input_select.rfid_6_notify_level
+          - input_select.rfid_7_notify_level
+          - input_select.rfid_8_notify_level
+          - input_select.rfid_9_notify_level
+          - input_text.rfid_1_notify_mute
+          - input_text.rfid_2_notify_mute
+          - input_text.rfid_3_notify_mute
+          - input_text.rfid_4_notify_mute
+          - input_text.rfid_5_notify_mute
+          - input_text.rfid_6_notify_mute
+          - input_text.rfid_7_notify_mute
+          - input_text.rfid_8_notify_mute
+          - input_text.rfid_9_notify_mute
+    sensor:
+      - name: Guardian Notify Prefs
+        unique_id: guardian_notify_prefs
+        icon: mdi:bell-cog-outline
+        # How many occupied keys have moved off the default (Important, nothing
+        # muted). 0 means the whole house is on the shipped default, which is
+        # the first thing worth knowing when alerts seem quiet.
+        state: >-
+          {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                         | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(n=0) %}
+          {% for i in slots %}
+            {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                       | string | trim | lower %}
+            {% set lvl = states('input_select.rfid_' ~ i ~ '_notify_level')
+                         | string | trim %}
+            {% set mute = states('input_text.rfid_' ~ i ~ '_notify_mute')
+                          | string | trim %}
+            {% if c | length == 16 and c is match('^[0-9a-f]{16}$')
+               and (lvl not in ['Important', 'unknown', 'unavailable', '']
+                    or mute not in ['', 'unknown', 'unavailable']) %}
+              {% set ns.n = ns.n + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.n }}
+        attributes:
+          # The full table, as a list of mappings, so a state cap of 255 can
+          # never truncate it. Same shape the delivery path computes inline.
+          prefs: >-
+            {% set slots = (states('sensor.guardian_rfid_slots') | string).split(',')
+                           | map('trim') | reject('eq', '') | list %}
+            {% set ns = namespace(rows=[]) %}
+            {% for i in slots %}
+              {% set c = states('input_text.rfid_' ~ i ~ '_card_id')
+                         | string | trim | lower %}
+              {% set lvl = states('input_select.rfid_' ~ i ~ '_notify_level')
+                           | string | trim %}
+              {% set mute = states('input_text.rfid_' ~ i ~ '_notify_mute')
+                            | string | trim %}
+              {% set target = states('input_select.rfid_' ~ i ~ '_notify_target')
+                              | string | trim %}
+              {% set ns.rows = ns.rows + [{
+                   'slot': i,
+                   'occupied': c | length == 16 and c is match('^[0-9a-f]{16}$'),
+                   'target': target if target not in ['unknown', 'unavailable', '']
+                             else 'none',
+                   'level': lvl if lvl in ['Everything', 'Important',
+                                           'Urgent only', 'Off'] else 'Important',
+                   'muted': (mute.split(',') | map('trim') | reject('eq', '')
+                             | list) if mute not in ['unknown', 'unavailable', '']
+                            else [] }] %}
+            {% endfor %}
+            {{ ns.rows }}
+
+  # Every notify target a household could pick, minus Guardian's own internal
+  # ones. Object ids only (the part after notify.), comma-joined, sorted.
+  #
+  # This used to be trigger-based on start / entity_registry_updated / a ten
+  # minute tick, reading integration_entities('mobile_app'). That is what broke
+  # every phone link on the live house: a trigger-based sensor renders `unknown`
+  # after a template reload and stays that way until the next tick, and
+  # integration_entities() comes back empty in the window where the mobile_app
+  # entries have not finished loading. Meanwhile the picker on Keys renders from
+  # input_select.rfid_N_notify_target's own `options` attribute, which persists
+  # in .storage forever - so the panel kept showing the right phone, the Send
+  # test alert button stayed enabled, and script.guardian_notify_person's
+  # `mapped` template decided the slot was unlinked because the object id was
+  # not in this CSV. "Nothing was sent", with a phone plainly selected.
+  #
+  # So: a plain state-driven template sensor over the notify domain. It is never
+  # `unknown`, it re-renders the moment a notify entity appears or disappears,
+  # and it needs no periodic tick to become correct. Do not filter by an
+  # entity-id prefix such as mobile_app_ - real device names on this install do
+  # not follow that convention (e.g. notify.ipad_kitchen), and tablets are a
+  # legitimate place to send a door alert.
+  #
+  # `phones` carries the same list as a real list. A state is capped at 255
+  # characters and a rack of long device names can exceed that, which would put
+  # the entity into an error state and take every link down with it; consumers
+  # that can read an attribute should prefer it over splitting the state.
+  - sensor:
+      - name: Guardian Notify Targets Available
+        unique_id: guardian_notify_targets_available
+        icon: mdi:cellphone-message
+        state: >-
+          {% set skip = ['guardian_data_log', 'persistent_notification',
+                         'guardian_alerts'] %}
+          {% set ids = states.notify
+                       | map(attribute='object_id')
+                       | reject('in', skip) | unique | list | sort %}
+          {{ ids | join(',') }}
+        attributes:
+          phones: >-
+            {% set skip = ['guardian_data_log', 'persistent_notification',
+                           'guardian_alerts'] %}
+            {{ states.notify | map(attribute='object_id')
+               | reject('in', skip) | unique | list | sort }}
+          # Counted from the domain, not from this.state: in a state-based
+          # template entity `this` is the state as it was BEFORE this render,
+          # so a count taken from it would report the previous list.
+          count: >-
+            {% set skip = ['guardian_data_log', 'persistent_notification',
+                           'guardian_alerts'] %}
+            {{ states.notify | map(attribute='object_id')
+               | reject('in', skip) | unique | list | count }}
+
+      # Twin of sensor.guardian_version, declaring the version of THIS file.
+      # Two packages can go stale independently - they are two copies - and this
+      # one is the one that matters most for alerts: it owns
+      # sensor.guardian_rfid_slots, which script.guardian_notify_person consults
+      # before it will read a slot's phone link at all. If this file is missing
+      # or failed to merge, that sensor is absent, and every alert in the house
+      # is skipped no matter how healthy the rest of the install is.
+      #
+      # Its mere existence is the useful signal; the literal tells the panel
+      # whether it matches the other halves. See the long note on
+      # sensor.guardian_version in packages/guardian.yaml for why any of this
+      # exists and what to bump together.
+      - name: Guardian RFID Version
+        unique_id: guardian_rfid_version
+        icon: mdi:tag-check-outline
+        state: '2.32.5'

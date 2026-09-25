@@ -1,0 +1,1724 @@
+homeassistant:
+  allowlist_external_dirs:
+    # camera.snapshot writes ambient.jpg here. Deliberately NOT /config/www:
+    # Home Assistant serves that tree as /local with no authentication, so a
+    # snapshot written there is a live front-door frame readable by anything
+    # that can reach port 8123. This directory is not web-served.
+    - /config/guardian
+    # For the "File" notify integration (Settings -> Devices & Services -> Add
+    # Integration -> File) that "Guardian: Data Log - *" write to. Paths under
+    # /config are not implicitly allowed - is_allowed_path() only matches
+    # entries listed here, same reason /config/guardian is listed above.
+    - /config
+
+# Emergency fallback when no RFID slot has a phone linked lives in
+# script.guardian_notify_broadcast: it fans out to every object id in
+# sensor.guardian_notify_targets_available (the same closed set the
+# picker uses). A YAML notify: platform: group block cannot be made
+# dynamic — it loads once at parse time — so it is not declared here.
+
+input_boolean:
+  guardian_enrollment_mode:
+    name: Guardian Enrollment Mode
+    icon: mdi:card-plus
+  # UI-armed, keypad-completed master PIN rotation. Turning this on does NOT
+  # change the PIN: the portal still has to demand the current PIN (# to
+  # confirm) then a new PIN (# to finish) before script.guardian_set_pin is
+  # called. Dashboard is this boolean only — no password field. Mutually
+  # exclusive with enrollment (checked wherever either is turned on).
+  guardian_pin_change_mode:
+    name: Guardian PIN Change Mode
+    icon: mdi:dialpad
+    initial: false
+  guardian_lamp_sampling:
+    name: Guardian Lamp Sampling
+    icon: mdi:camera-metering-center
+  # Latches so the portal-offline watchdog alerts once per outage rather than
+  # announcing "back online" after every routine restart.
+  guardian_portal_offline_notified:
+    name: Guardian Portal Offline Notified
+    icon: mdi:lan-disconnect
+  # Same latch for the doorbell. The doorbell previously had no health
+  # monitoring of any kind - the only signal that it had dropped off the
+  # network was the DOORBELL token appearing in sensor.guardian_faults.
+  guardian_doorbell_offline_notified:
+    name: Guardian Doorbell Offline Notified
+    icon: mdi:doorbell
+  # And the same latch for the third detection channel, which had none.
+  #
+  # Guardian detects an intruder three ways: the portal's door contact, the
+  # doorbell's reader, and Frigate person-detection over MQTT. The first two
+  # each got an offline watchdog. Frigate did not - so if the broker died, the
+  # add-on stopped or the camera key drifted, "person detected while all cards
+  # are away" simply never fired again, in silence, for as long as it took
+  # somebody to notice they had stopped getting them. A detection channel that
+  # can fail quietly is worse than one that is not there, because the household
+  # is counting on it.
+  #
+  # script.guardian_setup_wizard already names the whole MQTT chain at install
+  # time. That covers day one. This covers day four hundred.
+  guardian_frigate_offline_notified:
+    name: Guardian Frigate Offline Notified
+    icon: mdi:cctv-off
+  # Two latches written at shutdown and read once at the next start, so a
+  # household whose authentication flow was killed by a restart is told about it.
+  #
+  # THEY EXIST BECAUSE THE OBVIOUS VERSION IS UNREACHABLE. "Guardian: Startup
+  # State Recovery" used to answer "were we mid-challenge?" by reading
+  # portal_mfa_pending / guardian_entry_challenge / guardian_doorbell_exit_pin,
+  # and "were we mid-PIN-change?" by reading guardian_pin_change_mode. All four
+  # carry initial: false, which Home Assistant applies on every start and which
+  # SKIPS restore_state - so all four are guaranteed off by the time that
+  # automation reads them, both variables were always false, and neither
+  # notification could ever fire. Two recovery notices that had never once been
+  # sent.
+  #
+  # Dropping initial: false from those four would have made the read work and
+  # opened a real hole to do it: a restored guardian_entry_challenge is a
+  # condition on "Guardian: Elevated Opening Supervisor", so for the thirty
+  # seconds before guardian_reset_auth runs, an elevated-mode opening would be
+  # neither challenged nor alarmed. A notification is not worth thirty seconds of
+  # blindness at the front door. These latches carry the fact across the restart
+  # instead, and the flags keep clearing on boot exactly as before.
+  #
+  # No initial: on purpose - restoring is the entire mechanism. Written on
+  # EVENT_HOMEASSISTANT_FINAL_WRITE, which is the last stage at which a write
+  # still reaches the restore snapshot. A power cut or a crash writes nothing and
+  # sends no notice; that is the honest limit of this and is documented in
+  # DEPLOY.md's forty-first pass rather than papered over.
+  guardian_restart_mid_challenge:
+    name: Guardian Restart Interrupted A Challenge
+    icon: mdi:shield-off-outline
+  guardian_restart_mid_pin_change:
+    name: Guardian Restart Interrupted A PIN Change
+    icon: mdi:dialpad
+  # Manual Super Surveillance switch. No initial: — this is a user toggle and
+  # YAML initial: would skip restore_state on every start. Was a UI helper.
+  super_surveillance_mode:
+    name: Super Surveillance Mode
+    icon: mdi:cctv
+  # Session flag for an open MFA / PIN challenge. initial: false so a restart
+  # does not restore a stranded pending state (the MFA timer is restore: false).
+  portal_mfa_pending:
+    name: Portal MFA Pending
+    icon: mdi:shield-key-outline
+    initial: false
+  # guest_bypass was here. Removed in the forty-first pass along with "Guardian:
+  # Guest Bypass Trigger" and the panel's E.guestBypass mapping. It was written
+  # by one automation, read by nothing, and had been in that state since audit
+  # F-07 - kept each time on the argument that a half-wired feature pointing at
+  # the right sensor is easier to finish than one that does not. That argument
+  # holds for the author and fails for everyone else: the honest comment
+  # explaining that it does nothing lives in the YAML, and what a household sees
+  # is a helper called "Guest Bypass" in their entity list. Guest handling, if
+  # it is ever wanted, is one doorbell-button trigger to write from scratch.
+  # Super Surveillance programs: a fixed rack of independent weekday x hour
+  # windows. There is no master enable boolean and no leftover "night mode".
+  # Each program has its own enable flag, visible in the panel; an empty set
+  # of days also never matches. Disable keeps the days, hours and name.
+  #
+  # _created vs _enabled are two different questions and must stay that way.
+  # _created means "this household made this program" - it is what puts a card
+  # in the panel. _enabled means "this program may elevate" - it is a setting
+  # on a card that already exists. Turning a program off leaves it created and
+  # visible; only Delete clears _created, and Delete works the same whether the
+  # program was on or off. Nothing anywhere may infer one from the other.
+  # sensor.guardian_ss_programs_created below holds the only copy of the
+  # created predicate; do not re-derive it here or in the panel.
+  #
+  # Home Assistant's native schedule: helper would evaluate the clock for us
+  # (per-day ranges, exact boundary transitions, overnight by splitting a
+  # window in two). It does not fit this package. A YAML schedule: entity is
+  # not writable (editable: false), a storage helper is not versioned here and
+  # has no initial:, and the panel's contract is read-state / call existing
+  # services - it cannot schedule/create a helper that does not exist. Packing
+  # several windows into one input_text would hit the 255-character cap the
+  # moment a household named them. These input_* helpers plus the template
+  # below are the same style as the rest of the file, and the panel already
+  # knows how to toggle / set_value them. It lists whatever
+  # sensor.guardian_ss_programs says at runtime, the same way it lists RFID
+  # slots.
+  #
+  # Do not leave a whitelist id without helpers, or helpers without a
+  # whitelist id: elevated_mode would skip a program, or a leftover enable
+  # would still match.
+  #
+  # Create Program claims the first free rack position and writes: enabled,
+  # every day on, start 0 / end 5, reproducing the old 00:00-05:00 window.
+  # That is configuration written by script.guardian_create_ss_program, not a
+  # rule in the template. YAML initial: is omitted so a restart cannot reset
+  # a day you turned off (restore_state). A new install starts with no
+  # programs created at all, so More → Security shows none until you tap
+  # Create Program. Overlapping programs are fine (OR). A wrapping window
+  # belongs to the start day - see the hour helpers.
+  guardian_ss_1_created:
+    name: Guardian SS 1 Created
+    icon: mdi:calendar-plus
+  guardian_ss_1_enabled:
+    name: Guardian SS 1 Enabled
+    icon: mdi:calendar-clock
+  guardian_ss_1_mon:
+    name: Guardian SS 1 Monday
+    icon: mdi:calendar-clock
+  guardian_ss_1_tue:
+    name: Guardian SS 1 Tuesday
+    icon: mdi:calendar-clock
+  guardian_ss_1_wed:
+    name: Guardian SS 1 Wednesday
+    icon: mdi:calendar-clock
+  guardian_ss_1_thu:
+    name: Guardian SS 1 Thursday
+    icon: mdi:calendar-clock
+  guardian_ss_1_fri:
+    name: Guardian SS 1 Friday
+    icon: mdi:calendar-clock
+  guardian_ss_1_sat:
+    name: Guardian SS 1 Saturday
+    icon: mdi:calendar-clock
+  guardian_ss_1_sun:
+    name: Guardian SS 1 Sunday
+    icon: mdi:calendar-clock
+  guardian_ss_2_created:
+    name: Guardian SS 2 Created
+    icon: mdi:calendar-plus
+  guardian_ss_2_enabled:
+    name: Guardian SS 2 Enabled
+    icon: mdi:calendar-clock
+  guardian_ss_2_mon:
+    name: Guardian SS 2 Monday
+    icon: mdi:calendar-clock
+  guardian_ss_2_tue:
+    name: Guardian SS 2 Tuesday
+    icon: mdi:calendar-clock
+  guardian_ss_2_wed:
+    name: Guardian SS 2 Wednesday
+    icon: mdi:calendar-clock
+  guardian_ss_2_thu:
+    name: Guardian SS 2 Thursday
+    icon: mdi:calendar-clock
+  guardian_ss_2_fri:
+    name: Guardian SS 2 Friday
+    icon: mdi:calendar-clock
+  guardian_ss_2_sat:
+    name: Guardian SS 2 Saturday
+    icon: mdi:calendar-clock
+  guardian_ss_2_sun:
+    name: Guardian SS 2 Sunday
+    icon: mdi:calendar-clock
+  guardian_ss_3_created:
+    name: Guardian SS 3 Created
+    icon: mdi:calendar-plus
+  guardian_ss_3_enabled:
+    name: Guardian SS 3 Enabled
+    icon: mdi:calendar-clock
+  guardian_ss_3_mon:
+    name: Guardian SS 3 Monday
+    icon: mdi:calendar-clock
+  guardian_ss_3_tue:
+    name: Guardian SS 3 Tuesday
+    icon: mdi:calendar-clock
+  guardian_ss_3_wed:
+    name: Guardian SS 3 Wednesday
+    icon: mdi:calendar-clock
+  guardian_ss_3_thu:
+    name: Guardian SS 3 Thursday
+    icon: mdi:calendar-clock
+  guardian_ss_3_fri:
+    name: Guardian SS 3 Friday
+    icon: mdi:calendar-clock
+  guardian_ss_3_sat:
+    name: Guardian SS 3 Saturday
+    icon: mdi:calendar-clock
+  guardian_ss_3_sun:
+    name: Guardian SS 3 Sunday
+    icon: mdi:calendar-clock
+  guardian_ss_4_created:
+    name: Guardian SS 4 Created
+    icon: mdi:calendar-plus
+  guardian_ss_4_enabled:
+    name: Guardian SS 4 Enabled
+    icon: mdi:calendar-clock
+  guardian_ss_4_mon:
+    name: Guardian SS 4 Monday
+    icon: mdi:calendar-clock
+  guardian_ss_4_tue:
+    name: Guardian SS 4 Tuesday
+    icon: mdi:calendar-clock
+  guardian_ss_4_wed:
+    name: Guardian SS 4 Wednesday
+    icon: mdi:calendar-clock
+  guardian_ss_4_thu:
+    name: Guardian SS 4 Thursday
+    icon: mdi:calendar-clock
+  guardian_ss_4_fri:
+    name: Guardian SS 4 Friday
+    icon: mdi:calendar-clock
+  guardian_ss_4_sat:
+    name: Guardian SS 4 Saturday
+    icon: mdi:calendar-clock
+  guardian_ss_4_sun:
+    name: Guardian SS 4 Sunday
+    icon: mdi:calendar-clock
+  # Diagnostic aid, OFF by default. When on, routine decisions that normally
+  # stay silent (each lamp verdict, each rejected card) are pushed to the
+  # phones. Useful while confirming a fix; noisy as a permanent setting.
+  guardian_verbose_notifications:
+    name: Guardian Verbose Notifications
+    icon: mdi:bullhorn-outline
+  # An elevated-mode door opening that had no completed passage window is now a
+  # timed authentication challenge rather than an instant siren. This is on for
+  # the duration of that challenge.
+  #
+  # It exists as its own flag rather than reusing portal_mfa_pending because the
+  # two are orthogonal: a PIN challenge started BEFORE the opening is inherited
+  # as the card factor (guardian_challenge_card_ok) rather than being a second
+  # independent clock. Card and PIN are both required; see those two flags.
+  guardian_entry_challenge:
+    name: Guardian Entry Challenge
+    icon: mdi:shield-alert-outline
+    initial: false
+  # Factors presented during the 30s elevated entry challenge. Both must be on
+  # before script.guardian_clear_entry_challenge runs. Cleared with the
+  # challenge itself. Either order is accepted.
+  guardian_challenge_card_ok:
+    name: Guardian Challenge Card Factor
+    icon: mdi:nfc
+    initial: false
+  guardian_challenge_pin_ok:
+    name: Guardian Challenge PIN Factor
+    icon: mdi:dialpad
+    initial: false
+  # Elevated doorbell-exit second factor. On while the owner has
+  # input_number.guardian_doorbell_exit_pin_minutes to submit the master PIN
+  # from their mapped phone (no keypad at the exterior reader). Timeout raises
+  # guardian.major_alarm. restore-class: the timer is restore: false, so
+  # guardian_reset_auth and the auth watchdog must clear this flag.
+  guardian_doorbell_exit_pin:
+    name: Guardian Doorbell Exit PIN Window
+    icon: mdi:cellphone-key
+    initial: false
+  # Has script.guardian_setup_wizard already applied this install's first-boot
+  # defaults. Off on a fresh install, on afterwards, and it restores - so the
+  # wizard writes the recommended numbers exactly once and a household that
+  # later changes one of them keeps their value across every restart.
+  #
+  # No initial:. That is the whole point of the flag: YAML initial: skips
+  # restore_state on every start, which would reset this to off on every boot
+  # and re-apply the defaults over the household's own settings - the exact
+  # failure the notes on portal_pin_hash, guardian_presence_trackers and
+  # rfid_N_hash all describe. Clear it by hand (Developer Tools -> States, or
+  # the helper's own toggle) to deliberately re-run the wizard's writes.
+  guardian_setup_complete:
+    name: Guardian Setup Complete
+    icon: mdi:clipboard-check-outline
+
+input_button:
+  # Manual "put everything back to a known-good state" control - see
+  # script.guardian_reset. Deliberately Home Assistant-side only and NOT
+  # available on the portal keypad: a reset clears a live MFA challenge, so a
+  # wall-panel button would hand that capability to anyone standing at the door.
+  guardian_reset:
+    name: Guardian Reset
+    icon: mdi:restore-alert
+
+input_text:
+  # The portal's status strip. Session state: initial: none so a restart does
+  # not restore ALARM with no siren loop running (audit F-19). Was a UI helper.
+  portal_display_state:
+    name: Portal Display State
+    initial: none
+    max: 100
+  # SHA-256 hex of the master PIN. max: 64 is load-bearing — a shorter max
+  # silently truncates and every comparison fails. No initial: — YAML initial
+  # would wipe the hash on every start. Was a UI helper; migrating onto YAML
+  # requires deleting the UI helper first (see DEPLOY.md).
+  portal_pin_hash:
+    name: Portal PIN Hash
+    max: 64
+  # Comma-separated Home Assistant user ids, refreshed by an admin session of
+  # the Guardian panel from config/auth/list. Empty means single-account mode:
+  # any login may manage every key, which is today's behaviour and needs no
+  # extra setup. No initial: — a restart must not forget that a second user
+  # exists. Guardian scripts use this plus rfid_N_ha_user_id to refuse writes;
+  # Home Assistant still has no general per-service ACL.
+  guardian_ha_admin_ids:
+    name: Guardian HA Admin Ids
+    max: 255
+  guardian_ha_user_ids:
+    name: Guardian HA User Ids
+    max: 255
+  # Written on a doorbell-side authorized scan. Read by nothing; the write
+  # must still succeed or guardian_authorize_passage aborts before GRANTED.
+  last_doorbell_rfid_time:
+    name: Last Doorbell RFID Time
+    initial: none
+    max: 40
+  # Stays single-valued: an MFA challenge is deliberately about one subject.
+  pending_mfa_slot:
+    name: Guardian Pending MFA Slot
+    initial: none
+    max: 4
+  # These two hold a comma-separated LIST of slot ids ("2,4"), not a single id,
+  # so that several people scanning within one 20s window are all completed by
+  # one door opening. Previously each scan overwrote the last, and when three
+  # people left together and two scanned, only the last scanner's card flipped.
+  #
+  # "none" means empty. Every reader parses defensively with
+  # .split(',') | map('trim') | select('in', states('sensor.guardian_rfid_slots')),
+  # so 'none', 'unknown', 'unavailable' and '' all reduce to an empty list.
+  # Nine slots is the keypad cap ("1,2,3,4,5,6,7,8,9" = 17 characters); 32 is
+  # unreachable headroom so the write can never be silently rejected.
+  pending_entry_slot:
+    name: Guardian Pending Entry Slot
+    initial: none
+    max: 32
+  pending_exit_slot:
+    name: Guardian Pending Exit Slot
+    initial: none
+    max: 32
+  # ISO timestamp and optional device_id ("ts|id") for an opening that Door
+  # Open Direction could not classify at the reed edge. "none" when idle.
+  # Late Resolve on door_closed reads this, emits the delayed direction
+  # event, and clears it. 80 covers an ISO timestamp plus a 32-char ESPHome
+  # device id.
+  guardian_pending_direction:
+    name: Guardian Pending Direction
+    initial: none
+    max: 80
+  pending_mfa_source:
+    name: Guardian Pending MFA Source
+    initial: none
+    max: 24
+  # Which RFID slot opened the doorbell-exit PIN window. "none" when idle.
+  # Single-valued like pending_mfa_slot: the prompt is sent only to that
+  # slot's mapped phone.
+  guardian_doorbell_exit_slot:
+    name: Guardian Doorbell Exit Slot
+    initial: none
+    max: 4
+  # Live view prefers camera.door_camera (Frigate / door cam) when this is
+  # empty, unknown, or the leftover camera.tapo_c110. No initial: — YAML
+  # input_text with initial: skips restore_state on every start, which is
+  # what wiped this helper (and the two below) after each restart. Set it
+  # in More → Install (Save) or Developer Tools → States; that value then
+  # survives a reboot.
+  guardian_camera_entity:
+    name: Guardian Camera Entity
+    max: 100
+  # Which IR / night-vision entity the luma sampler reads. Empty / unknown
+  # / none is unset; the sampler then treats the still as possibly IR-on.
+  # No initial: for the same restore-skip reason as guardian_camera_entity.
+  guardian_camera_ir_entity:
+    name: Guardian Camera IR Entity
+    max: 100
+  # Must match the camera key in frigate/config.yml (this install: door_camera).
+  # A previous default of front_door meant the person-detected-while-away
+  # condition never matched (audit F-15). No initial: — same restore-skip
+  # as the camera entity helper.
+  guardian_frigate_camera_name:
+    name: Guardian Frigate Camera Name
+    max: 64
+  # OPT-IN. Comma-separated device_tracker entity IDs, e.g.
+  # "device_tracker.phone_one,device_tracker.phone_two".
+  #
+  # While empty, person-detection behaves exactly as before: alert only when all
+  # resident cards read Away. That gate is self-defeating, because the system
+  # deliberately tolerates people leaving without scanning, and every unscanned
+  # exit strands a card at "At home" which suppresses the alert indefinitely -
+  # one person forgetting once disables the burglar alarm (audit F-16).
+  #
+  # Once populated, phone presence becomes authoritative for that decision:
+  # phones are independent of whether anyone remembered to scan, so a stale card
+  # no longer suppresses the alert, and someone genuinely home no longer trips it.
+  #
+  # No initial: — even initial: '' skips restore_state, which silently
+  # emptied this list on every restart and dropped presence back to cards.
+  guardian_presence_trackers:
+    name: Guardian Presence Trackers
+    max: 255
+  # The alarm reason previously existed only as guardian.major_alarm event data,
+  # so the portal's ALARM screen structurally could not say why it was alarming.
+  # "Guardian: Major Alarm Handler" writes it here first.
+  guardian_alarm_reason:
+    name: Guardian Alarm Reason
+    initial: none
+    max: 100
+  # THE ONLY THING ABOUT A LIVE ALARM THAT SURVIVES A RESTART, and it exists
+  # because until the forty-fifth pass nothing did.
+  #
+  # NOTE THE ABSENCE OF initial:. That absence is the entire feature and it is
+  # the opposite of every other helper in this block. `initial:` is applied by
+  # Home Assistant on every start and SKIPS restore_state, so a helper that
+  # declares one can never carry information across a restart - which is
+  # precisely why portal_display_state above cannot, and why the branch in
+  # "Guardian: Startup State Recovery" that tested it for ALARM had never once
+  # fired on any install. A restart therefore ended a live alarm silently: no
+  # siren, no second push, no record, and dead code where the recovery was
+  # supposed to be.
+  #
+  # Holds either the literal `none` or the ISO timestamp at which the display
+  # was last set to ALARM. A timestamp rather than a boolean because the value
+  # has to answer "how long ago", not just "whether": a restore_state snapshot
+  # can be up to fifteen minutes stale, so a latch read at boot proves an alarm
+  # was running at SOME point, and only its age separates "Home Assistant was
+  # restarted during a break-in" from "the power came back after an eight-hour
+  # cut". Resuming the second is the 3am false alarm that teaches a household to
+  # unplug the system - the same trade the portal's offline siren makes on the
+  # device side, for the same reason, and there because an ESP32 has no clock.
+  # Home Assistant does have one, so here the bound can be honest.
+  #
+  # Written ONLY by script.guardian_set_display, which is already the single way
+  # to put a verdict on the portal. Coupling it there rather than to each of the
+  # fifty-odd call sites means the latch and the screen cannot disagree: either
+  # both moved or neither did. Do not write this helper from anywhere else.
+  guardian_alarm_latch:
+    name: Guardian Alarm Latch
+    max: 40
+  # Short summary of the last completed opening (close direction, dwell,
+  # how wide it was opened), written by "Guardian: Door Event Log". Rendered
+  # verbatim on the portal's diagnostics page.
+  guardian_last_door_summary:
+    name: Guardian Last Door Summary
+    initial: none
+    max: 64
+  # The lamp's state immediately BEFORE a sample blacks the bulb out, as
+  # "off" or "on|<brightness>|<kelvin>".
+  #
+  # script.guardian_sample_ambient_light turns the lamp off as its first
+  # visible act and only puts it back in its closing choose. Anything that
+  # kills the run in between - a restart, a snapshot that hangs, the script
+  # being stopped - left the lamp off with nobody holding the information
+  # needed to restore it. The watchdog cleared the sampling flag and walked
+  # away. At night that is indistinguishable from "the lamp turned itself off",
+  # which is exactly what was reported.
+  guardian_lamp_presample:
+    name: Guardian Lamp Pre-Sample State
+    initial: none
+    max: 40
+  # One line describing the most recent lamp decision, e.g.
+  # "22:20 luma=31.4 sun=-12.3 on_camera manual" or "22:20 FAILED no reading".
+  # Eighth pass adds a mode suffix: manual / learn / auto.
+  #
+  # Until now a wrong decision was completely invisible: the only lamp
+  # notification fired when the reading was UNUSABLE, so a reading that was
+  # valid but wrong (an IR-flooded night frame measuring 146 luma) switched the
+  # lamp off and reported nothing, anywhere. This makes every verdict legible
+  # in the UI, on the portal's diagnostics page, and in the history graph.
+  guardian_lamp_last_result:
+    name: Guardian Lamp Last Result
+    initial: none
+    max: 100
+  # Unix timestamp (as_timestamp float, not a datetime - those stay strings
+  # after literal_eval and then raise in comparisons, audit F-24) of when
+  # the configured lamp first disagreed with the sun-expected state. "none"
+  # means they agree, or there is no expected state (twilight, missing sun).
+  #
+  # The sampler's sun clamp only fires when a valid reading CROSSES a
+  # threshold and contradicts the sky (luma >= 90 at night -> on_sun_override).
+  # A downstairs window that parks luma in the 45-90 hold band never crosses,
+  # so the lamp stays whatever it was. This clock is that hole: after
+  # guardian_lamp_mismatch_max_minutes of disagreement the lamp is forced,
+  # even when the camera number looks valid.
+  guardian_lamp_mismatch_since:
+    name: Guardian Lamp Sun-Mismatch Since
+    initial: none
+    max: 24
+  # Which card slot the next enrollment writes to, chosen on the portal keypad.
+  # Empty means "let the system pick the first free one".
+  #
+  # Enrollment used to be first-free-wins with no way to target a slot, so
+  # re-enrolling one person's card meant clearing that person's input_text by
+  # hand in the Home Assistant UI first, and with every slot occupied the
+  # feature simply refused to work.
+  guardian_enrollment_slot:
+    name: Guardian Enrollment Slot
+    initial: ''
+    max: 1
+  # Which step of a keypad PIN-change session is open: none / current / new.
+  # The display string is a verdict and can be overwritten by DENIED, so the
+  # step cannot live there. There is no confirm-again step: current PIN + #,
+  # then new PIN + #.
+  guardian_pin_change_step:
+    name: Guardian PIN Change Step
+    initial: none
+    max: 16
+  # Where the opening that opened the current entry challenge came from -
+  # "outside", "inside" or "unknown". Carried into the alarm reason and the data
+  # log so a timed-out challenge says which door event it came from.
+  guardian_challenge_origin:
+    name: Guardian Challenge Origin
+    initial: none
+    max: 16
+  # Optional short labels so the panel can say "Weeknights" instead of
+  # "Program 1". No initial: - YAML input_text initial: would wipe the name
+  # on every Home Assistant start (same lesson as rfid_N_name).
+  guardian_ss_1_name:
+    name: Guardian SS 1 Name
+    max: 32
+  guardian_ss_2_name:
+    name: Guardian SS 2 Name
+    max: 32
+  guardian_ss_3_name:
+    name: Guardian SS 3 Name
+    max: 32
+  guardian_ss_4_name:
+    name: Guardian SS 4 Name
+    max: 32
+  # Restore-safe mirror of input_select.guardian_lamp_target. YAML options are
+  # only `none`, so Home Assistant cannot restore a previously selected light
+  # on start. No initial:. script.guardian_refresh_lamp_options copies this
+  # back onto the select after rebuilding options. Empty on a first run: the
+  # target stays `none` until somebody picks a bulb on More -> Lamp. There is
+  # no preferred make to fall back to.
+  guardian_lamp_saved:
+    name: Guardian Lamp Saved
+    max: 100
+
+input_number:
+  # Consecutive MFA PIN misses while elevated. Session counter. Was a UI helper.
+  mfa_failed_attempts:
+    name: MFA Failed Attempts
+    icon: mdi:counter
+    min: 0
+    max: 10
+    step: 1
+    initial: 0
+    mode: box
+  guardian_dark_threshold:
+    name: Guardian Dark Luminance Threshold
+    icon: mdi:brightness-4
+    min: 0
+    max: 255
+    step: 1
+    mode: box
+  guardian_bright_threshold:
+    name: Guardian Bright Luminance Threshold
+    icon: mdi:brightness-7
+    min: 0
+    max: 255
+    step: 1
+    mode: box
+  # Consecutive failed ambient samples. A single failure is routine (the Tapo
+  # integration drops the camera entity fairly often); three in a row means the
+  # measurement chain is genuinely broken, and only then is it worth a push.
+  guardian_lamp_fail_streak:
+    name: Guardian Lamp Fail Streak
+    icon: mdi:alert-decagram-outline
+    min: 0
+    max: 99
+    step: 1
+    initial: 0
+    mode: box
+  # How long the configured lamp may disagree with sun elevation before it is
+  # forced to the sky-expected state. Same bound both ways - do not shorten
+  # the OFF path to save power; reliability is the only goal.
+  #
+  # 30 minutes is two 10-minute "lamp off" samples after elevation < -6.
+  # Recommended first-boot 30. No initial: — YAML initial: skips restore.
+  guardian_lamp_mismatch_max_minutes:
+    name: Guardian Lamp Sun-Mismatch Max Minutes
+    icon: mdi:timer-alert-outline
+    min: 10
+    max: 180
+    step: 5
+    mode: box
+  # Counter-clockwise degrees applied to ambient.jpg before the Manual crop.
+  # Recommended first-boot 90 when the camera is mounted on its side (floor
+  # on the left). 0 if the JPEG is already upright. No initial:.
+  guardian_luma_rotate:
+    name: Guardian Luma Image Rotate
+    icon: mdi:rotate-left
+    min: 0
+    max: 270
+    step: 90
+    mode: box
+  # Hour bounds per Super Surveillance program, inclusive of start, exclusive
+  # of end. When start > end the window wraps past midnight and belongs to
+  # the start day (Monday 22:00-06:00 covers Monday 22-23 and Tuesday 00-05
+  # even if Tuesday is off). start == end means that program never opens.
+  # initial: 0 and 5 on program 1 is the default that used to be hardcoded as
+  # now().hour < 5 - it is configuration now, not a rule in the template.
+  # Programs 2-4 get the same usable window sitting unused. Recommended
+  # first-boot for program 1 is start 0 / end 5; no YAML initial:.
+  guardian_ss_1_start:
+    name: Guardian SS 1 Start Hour
+    icon: mdi:clock-start
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_1_end:
+    name: Guardian SS 1 End Hour
+    icon: mdi:clock-end
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_2_start:
+    name: Guardian SS 2 Start Hour
+    icon: mdi:clock-start
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_2_end:
+    name: Guardian SS 2 End Hour
+    icon: mdi:clock-end
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_3_start:
+    name: Guardian SS 3 Start Hour
+    icon: mdi:clock-start
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_3_end:
+    name: Guardian SS 3 End Hour
+    icon: mdi:clock-end
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_4_start:
+    name: Guardian SS 4 Start Hour
+    icon: mdi:clock-start
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  guardian_ss_4_end:
+    name: Guardian SS 4 End Hour
+    icon: mdi:clock-end
+    min: 0
+    max: 23
+    step: 1
+    mode: box
+  # Bumped by script.guardian_set_display on EVERY verdict write, including one
+  # that repeats the value already showing.
+  #
+  # input_text.set_value writing the value a helper already holds emits no
+  # state_changed event, and two things depended on that event: "Guardian: Portal
+  # LED Mirror", whose GRANTED branch sleeps 3s and then writes IDLE, and the
+  # portal's own "st != ui_prev_state" repaint/backlight wake. So a second
+  # GRANTED arriving during the first one's 3s window was swallowed whole - the
+  # screen never acknowledged it, and the FIRST run's delay still dropped the
+  # screen to IDLE underneath it. Scanning a card immediately after enrolling it
+  # is exactly that sequence, which is why a freshly enrolled card appeared to be
+  # ignored while unknown cards - which write a DIFFERENT value, DENIED_CARD -
+  # were always rejected visibly.
+  #
+  # A monotonically increasing counter always changes, so both consumers fire on
+  # every verdict regardless of whether the verdict repeats.
+  portal_display_seq:
+    name: Guardian Portal Display Sequence
+    icon: mdi:numeric
+    min: 0
+    max: 9999
+    step: 1
+    initial: 0
+    mode: box
+  # How long someone has to authenticate after an unauthorized elevated-mode
+  # opening before it becomes a full alarm. Applied at timer.start time, so
+  # changing it takes effect on the next challenge with no restart.
+  guardian_entry_challenge_seconds:
+    name: Guardian Entry Challenge Seconds
+    icon: mdi:timer-lock-outline
+    min: 10
+    max: 120
+    step: 5
+    mode: box
+  # The shortened grace window for the one case that used to fire the siren with
+  # no window at all: an opening from inside, corroborated by the lever, with
+  # every occupied resident card reading Away. That reading is not evidence on
+  # its own - the system tolerates unscanned exits and entries, so a resident who
+  # came home without scanning reads Away and was met with an instant 2am siren
+  # for opening their own front door. It now gets this many seconds to present a
+  # card and the master PIN instead. An unanswered short challenge raises exactly
+  # the same major alarm, so this costs delay, never detection.
+  #
+  # Only applies when input_text.guardian_presence_trackers is empty or the
+  # phones disagree with the cards. With trackers configured and agreeing that
+  # nobody is home, the instant siren still fires and this is not consulted.
+  guardian_empty_house_grace_seconds:
+    name: Guardian Empty House Grace Seconds
+    icon: mdi:timer-alert-outline
+    min: 5
+    max: 60
+    step: 5
+    mode: box
+  # Internal state, not a setting - same pattern as portal_display_seq above.
+  # "Guardian: Elevated Opening Supervisor" writes the challenge length it
+  # actually applied here, immediately before starting the timer, because that is
+  # now either guardian_entry_challenge_seconds or the grace value above and
+  # nothing downstream can work out which from the timer alone. Read by
+  # sensor.guardian_portal_countdown_total, so the portal progress bar is scaled
+  # to the real window, and by "Guardian: Entry Challenge Timeout", so a timed
+  # out short challenge does not claim it waited thirty seconds.
+  #
+  # Both readers only consult it while the entry-challenge timer is active or has
+  # just finished, so a value left over from the previous challenge is
+  # unreachable and nothing needs to reset it. Every value either source can
+  # produce is a multiple of 5, so set_value is always in step.
+  guardian_challenge_seconds_applied:
+    name: Guardian Challenge Seconds Applied
+    icon: mdi:timer-outline
+    min: 5
+    max: 120
+    step: 5
+    initial: 30
+    mode: box
+  # How long the owner of a card scanned at the exterior doorbell during an
+  # elevated-mode exit has to submit the master PIN from their phone. Applied
+  # at timer.start, so changing it takes effect on the next window with no
+  # restart. Not hardcoded: every other Guardian waiting-state duration is
+  # an input_number for the same reason.
+  guardian_doorbell_exit_pin_minutes:
+    name: Guardian Doorbell Exit PIN Minutes
+    icon: mdi:timer-lock-outline
+    min: 2
+    max: 30
+    step: 1
+    mode: box
+  # How old input_text.guardian_alarm_latch may be and still resume the alarm at
+  # startup. Read once, by "Guardian: Startup State Recovery".
+  #
+  # This is the figure that decides whether the house screams when the power
+  # comes back, so it is a helper a household can see and change rather than a
+  # number compiled into a template. That is the same rule the portal's offline
+  # siren follows with number.…offline_authority_hours, and it is here for the
+  # same reason: the two directions of getting it wrong are not symmetrical. Too
+  # short and a genuine break-in interrupted by a restart goes quiet. Too long
+  # and a Sunday-morning power cut ends with a siren nobody can explain, which
+  # is how a system gets unplugged for good.
+  #
+  # 30 minutes is deliberately larger than the fifteen-minute worst case of a
+  # restore_state snapshot, so an ordinary restart is always inside it, and far
+  # smaller than any outage anyone would call a power cut.
+  guardian_alarm_resume_minutes:
+    name: Guardian Alarm Resume Minutes
+    icon: mdi:alarm-light-outline
+    min: 1
+    max: 240
+    step: 1
+    initial: 30
+    mode: box
+  # Mild-path retries for keypad PIN change (elevated mode OFF). Wrong current
+  # PIN while elevated uses input_number.mfa_failed_attempts instead - this
+  # helper must not be written on that path, and mfa_failed_attempts must not
+  # be written on this one.
+  guardian_pin_change_fails:
+    name: Guardian PIN Change Fails
+    icon: mdi:counter
+    min: 0
+    max: 3
+    step: 1
+    initial: 0
+    mode: box
+
+input_select:
+  # Closed-set room-lamp picker. YAML options are only `none`; a companion
+  # automation copies currently-discovered light object ids onto this select
+  # at runtime. Mirrored to guardian_lamp_saved (no initial:) so a restart
+  # can re-apply it after the options list is rebuilt.
+  guardian_lamp_target:
+    name: Guardian Lamp Target
+    icon: mdi:lightbulb
+    options:
+      - none
+  # Which luminance path drives the configured lamp. Manual uses this
+  # install's crop (bottom 60%, p25) and input_number.guardian_dark_threshold /
+  # guardian_bright_threshold. Auto-calibrate learns a mask and a
+  # hysteresis band from lamp-off snapshots; it never writes those two
+  # helpers. No initial: — YAML initial: would skip restore and drop
+  # Auto-calibrate on every start. First option is the new-install default.
+  guardian_lamp_luma_mode:
+    name: Guardian Lamp Luma Mode
+    options:
+      - Manual (this home)
+      - Auto-calibrate
+    icon: mdi:tune-vertical
+
+timer:
+  guardian_entry_window:
+    name: Guardian Entry Window
+    duration: "00:00:20"
+    restore: false
+  guardian_exit_window:
+    name: Guardian Exit Window
+    duration: "00:00:20"
+    restore: false
+  guardian_mfa_window:
+    name: Guardian MFA Window
+    # Was 15s. Expiry fires a full guardian.major_alarm - red lamp, siren
+    # looping every 3s, high-priority push to both phones. 15s covers reading
+    # the display, recalling a 4-6 digit PIN and typing it on a 3x4 matrix
+    # keypad, possibly in the dark with full hands. The entry and exit windows
+    # allow 20s for the far simpler task of opening a door.
+    #
+    # The failure mode of being too strict here is not a security gain: it is
+    # the family switching super surveillance off, which is a net loss. Timeout
+    # still alarms and nothing else about the security model changes (F-14).
+    duration: "00:00:40"
+    restore: false
+  # Idle expiry for enrollment mode. Restarted by every successful enrollment
+  # and by every keypad slot selection, so enrolling several cards in one
+  # session never trips it.
+  #
+  # Enrollment no longer switches itself off after one card - the mode is now
+  # held open deliberately so several cards can be added and so the portal can
+  # show "# to exit". That makes an expiry mandatory rather than optional: while
+  # the mode is on, ANY unknown card presented by ANYONE is written into a slot.
+  guardian_enrollment_window:
+    name: Guardian Enrollment Window
+    duration: "00:02:00"
+    restore: false
+  # Grace window after an unauthorized elevated-mode opening. The duration here
+  # is only the fallback; timer.start overrides it from
+  # input_number.guardian_entry_challenge_seconds.
+  guardian_entry_challenge:
+    name: Guardian Entry Challenge Window
+    duration: "00:00:30"
+    restore: false
+  # Per-step window for keypad PIN change. Same 40s as MFA: the motor task is
+  # entering a 4-6 digit PIN on the same keypad. Restarted on every step
+  # advance and recoverable mismatch. restore: false, so Startup State Recovery
+  # and guardian_reset_auth must clear a restored boolean or the portal is
+  # stranded mid-flow with nothing counting down (F-19/F-31/F-36 class).
+  guardian_pin_change_window:
+    name: Guardian PIN Change Window
+    duration: "00:00:40"
+    restore: false
+  # Phone-PIN window after an elevated-mode exit scan at the doorbell (no
+  # keypad there). YAML duration is only the fallback; timer.start overrides
+  # it from input_number.guardian_doorbell_exit_pin_minutes. restore: false,
+  # so a restored boolean with no timer is the same stranded mid-flow as MFA.
+  guardian_doorbell_exit_pin_window:
+    name: Guardian Doorbell Exit PIN Window
+    duration: "00:10:00"
+    restore: false
+
+
+# Liveness for the one detection channel Guardian does not own.
+#
+# The portal and the doorbell are ESPHome devices, so Home Assistant publishes a
+# real status entity for each and "Guardian: Portal Offline Watchdog" can read
+# it directly. Frigate is not: it reaches Guardian only as MQTT messages on
+# frigate/events, and the absence of a message is indistinguishable from nothing
+# having walked past the camera. There is no entity to watch, so liveness has to
+# be recorded as it arrives.
+#
+# Frigate publishes frigate/stats about once a minute regardless of activity,
+# which is the heartbeat. "Guardian: Frigate Heartbeat" stamps this helper from
+# it; "Guardian: Frigate Detection Watchdog" alerts when the stamp goes stale.
+#
+# Deliberately NOT an mqtt: platform block, and this is the whole reason the
+# watchdog is built out of automations rather than a binary_sensor: an mqtt:
+# entity block requires the MQTT integration to be configured, and Guardian must
+# install cleanly on a household that runs no Frigate and no broker at all. An
+# automation with an MQTT trigger degrades to never firing, which is exactly
+# what "Guardian: Frigate Person Detected While Away" has always done.
+input_datetime:
+  guardian_frigate_last_seen:
+    name: Guardian Frigate Last Seen
+    icon: mdi:cctv
+    has_date: true
+    has_time: true
+
+
+# Everything the Interior Portal display needs that it cannot work out for
+# itself. Each of these is imported by esphome/portal-unit.yaml as a
+# `platform: homeassistant` sensor.
+#
+# The formatting is done here in Jinja rather than in the display lambda, so the
+# ESP32 does no string assembly and one import feeds one line of screen.
+template:
+  - sensor:
+      # Unix epoch at which the active Guardian window expires, 0 when none.
+      # MFA outranks entry outranks exit, matching the order in which the state
+      # machine can have them running. Published once per timer start - the
+      # portal counts down locally against its Home Assistant clock, so there is
+      # no per-second state traffic and the bar stays smooth if the link stutters.
+      #
+      # The entry challenge outranks everything: while it is running the door is
+      # already open and the countdown is the time left before a full alarm,
+      # which is the most urgent thing this screen can be showing.
+      - name: Guardian Portal Countdown Ends
+        unique_id: guardian_portal_countdown_ends
+        icon: mdi:timer-outline
+        state: >-
+          {% set ns = namespace(e='') %}
+          {% for t in ['timer.guardian_entry_challenge', 'timer.guardian_mfa_window',
+                       'timer.guardian_doorbell_exit_pin_window',
+                       'timer.guardian_entry_window', 'timer.guardian_exit_window',
+                       'timer.guardian_pin_change_window',
+                       'timer.guardian_enrollment_window'] %}
+            {% if ns.e == '' and is_state(t, 'active') %}{% set ns.e = t %}{% endif %}
+          {% endfor %}
+          {{ (as_timestamp(state_attr(ns.e, 'finishes_at'), 0) | int) if ns.e else 0 }}
+
+      # Full duration of that same window, in seconds. Scales the progress bar,
+      # so a 40 s MFA window and a 20 s entry window both read correctly.
+      - name: Guardian Portal Countdown Total
+        unique_id: guardian_portal_countdown_total
+        unit_of_measurement: s
+        icon: mdi:timer-sand
+        state: >-
+          {% set ns = namespace(e='') %}
+          {% for t in ['timer.guardian_entry_challenge', 'timer.guardian_mfa_window',
+                       'timer.guardian_doorbell_exit_pin_window',
+                       'timer.guardian_entry_window', 'timer.guardian_exit_window',
+                       'timer.guardian_pin_change_window',
+                       'timer.guardian_enrollment_window'] %}
+            {% if ns.e == '' and is_state(t, 'active') %}{% set ns.e = t %}{% endif %}
+          {% endfor %}
+          {# The entry challenge is started with a templated duration override
+             from input_number.guardian_entry_challenge_seconds, and the timer's
+             "duration" attribute is not a reliable place to read that back
+             across Home Assistant versions - it may still report the duration
+             configured in YAML. Read the source of truth instead, so raising the
+             grace window does not leave the progress bar scaled to 30 s and
+             pinned full for the first half of every challenge. The doorbell-exit
+             window is the same class of override, in minutes.
+
+             That source of truth is now guardian_challenge_seconds_applied, not
+             guardian_entry_challenge_seconds. The configured length is no longer
+             always the applied one: an inside opening with every card reading
+             Away and no presence-tracker corroboration gets a shortened
+             challenge from guardian_empty_house_grace_seconds, and reading the
+             configured helper would scale a 10 s bar to 30 s - full for the
+             first two thirds, then a jump. "Guardian: Elevated Opening
+             Supervisor" writes the applied number immediately before it starts
+             the timer. Falling back to the configured helper keeps this correct
+             if the applied one has not been created yet. #}
+          {% if ns.e == 'timer.guardian_entry_challenge' %}
+            {{ states('input_number.guardian_challenge_seconds_applied')
+               | int(states('input_number.guardian_entry_challenge_seconds') | int(30)) }}
+          {%- elif ns.e == 'timer.guardian_doorbell_exit_pin_window' %}
+            {{ (states('input_number.guardian_doorbell_exit_pin_minutes') | int(10)) * 60 }}
+          {%- elif ns.e %}
+            {% set p = ((state_attr(ns.e, 'duration') | default('0:00:00', true))
+                       | string).split(':') %}
+            {{ (p[0] | int(0)) * 3600 + (p[1] | int(0)) * 60 + (p[2] | int(0)) }}
+          {% else %}0{% endif %}
+
+      - name: Guardian Portal Countdown Label
+        unique_id: guardian_portal_countdown_label
+        icon: mdi:label-outline
+        state: >-
+          {% if is_state('timer.guardian_entry_challenge', 'active') %}AUTHENTICATE
+          {%- elif is_state('timer.guardian_mfa_window', 'active') %}PIN TIMEOUT
+          {%- elif is_state('timer.guardian_doorbell_exit_pin_window', 'active') %}PHONE PIN
+          {%- elif is_state('timer.guardian_entry_window', 'active')
+                   and is_state('timer.guardian_exit_window', 'active') %}PASSAGE
+          {%- elif is_state('timer.guardian_entry_window', 'active') %}ENTRY
+          {%- elif is_state('timer.guardian_exit_window', 'active') %}EXIT
+          {%- elif is_state('timer.guardian_pin_change_window', 'active') %}PIN CHANGE
+          {%- elif is_state('timer.guardian_enrollment_window', 'active') %}ENROLL
+          {%- else %}{% endif %}
+
+      # Compact fault list for the portal status strip. Empty means healthy.
+      #
+      # NOTE: a helper or device that does not exist reads as "unknown" here and
+      # is therefore reported as a fault. That is deliberate - a missing entity
+      # is a real deployment problem - but it does mean this sensor will light up
+      # until every entity below actually exists on your install.
+      - name: Guardian Faults
+        unique_id: guardian_faults
+        icon: mdi:alert-circle-outline
+        state: >-
+          {% set ns = namespace(f=[]) %}
+          {% set bad = ['unavailable', 'unknown', 'none', ''] %}
+          {# Was keyed off sensor.smart_doorbell_doorbell_wifi_signal going
+             unavailable, which is a proxy with up to 30s of lag. The doorbell
+             now publishes a real API status entity; guardian_doorbell_online
+             normalises it. #}
+          {% if not is_state('binary_sensor.guardian_doorbell_online', 'on') %}
+            {% set ns.f = ns.f + ['DOORBELL'] %}
+          {% endif %}
+          {% set cam = states('input_text.guardian_camera_entity') %}
+          {% if cam not in bad and states(cam) in bad %}
+            {% set ns.f = ns.f + ['CAMERA'] %}
+          {% endif %}
+          {# Was "states('sensor.guardian_camera_luminance') in bad", which lit
+             a PERMANENT fault: that sensor is deliberately unavailable between
+             samples. Its command_line poll (scan_interval 86400) runs against
+             an ambient.jpg that is minutes old, trips the 60s staleness guard
+             in guardian-luminance.py, and exits non-zero - so outside the few
+             seconds of an actual sample the sensor is *expected* to be
+             unavailable. The sampler's own verdict is the honest signal. #}
+          {% if 'FAILED' in states('input_text.guardian_lamp_last_result') %}
+            {% set ns.f = ns.f + ['LUMA'] %}
+          {% endif %}
+          {# esphome/portal-unit.yaml declares this with device_class: problem
+             and "return !(healthy)", so ON MEANS FAULTY. This clause has now
+             been inverted in both directions: it originally read 'on' (correct),
+             audit F-27 "fixed" it to 'off' (which reported a fault on every
+             healthy portal), and this restores 'on'. Check the firmware before
+             touching it again - portal-unit.yaml lambda, "IMU Healthy". #}
+          {% if is_state('binary_sensor.guardian_interior_portal_imu_healthy', 'on') %}
+            {% set ns.f = ns.f + ['IMU'] %}
+          {% endif %}
+          {{ ns.f | join(',') }}
+
+      # Doorbell link, formatted for the portal's diagnostics page: "OK -58",
+      # "OFFLINE 12m", or "NO DATA" when the entity does not exist at all.
+      #
+      # now() is referenced deliberately - Home Assistant re-renders templates
+      # containing it once a minute, which is what keeps the offline counter
+      # advancing without a dedicated timer.
+      - name: Guardian Doorbell Link
+        unique_id: guardian_doorbell_link
+        icon: mdi:doorbell
+        state: >-
+          {% set link = state_attr('sensor.guardian_doorbell_entities', 'link')
+             | default('', true) | string %}
+          {% set wifi = state_attr('sensor.guardian_doorbell_entities', 'wifi')
+             | default('', true) | string %}
+          {% set st = states(link) if link else 'unknown' %}
+          {% set r = states(wifi) if wifi else 'unknown' %}
+          {% if st == 'on' %}{{ 'OK ' ~ (r | int(0)) if is_number(r) else 'OK' }}
+          {%- elif st == 'off' %}
+            {% set ns = namespace(since=as_timestamp(now())) %}
+            {% if link and states[link] is defined %}
+              {% set ns.since = as_timestamp(states[link].last_changed, ns.since) %}
+            {% endif %}
+            {% set mins = ((as_timestamp(now()) - ns.since) / 60) | int(0) %}
+            {{ 'OFFLINE ' ~ mins ~ 'm' if mins < 600 else 'OFFLINE' }}
+          {%- elif is_number(r) %}{{ 'OK ' ~ (r | int(0)) }}
+          {%- else %}NO DATA{% endif %}
+
+      # THE runtime whitelist for Super Surveillance programs - capacity, not
+      # contents, exactly like sensor.guardian_rfid_slots. Home Assistant
+      # cannot create a helper at runtime, so the rack is pre-provisioned here
+      # and Create Program claims a free position rather than making one.
+      # Static on purpose: a template that listed the helpers here would be a
+      # second copy of the rack. Free positions are unclaimed slots, not
+      # programs - what the panel actually lists is
+      # sensor.guardian_ss_programs_created. Expanding the rack is: duplicate
+      # one helper block, append the id here and to that sensor's trigger
+      # entity_id list, full restart.
+      - name: Guardian SS Programs
+        unique_id: guardian_ss_programs
+        icon: mdi:calendar-clock
+        state: '1,2,3,4'
+        attributes:
+          count: >-
+            {{ (this.state | string).split(',') | map('trim')
+               | reject('eq', '') | list | count }}
+
+      # Resolved light.* entity for the room lamp. Closed-set: only an object
+      # id that is currently on sensor.guardian_lights_available. Consumers
+      # use this state as entity_id; `none` means no lamp is configured.
+      - name: Guardian Lamp Entity
+        unique_id: guardian_lamp_entity
+        icon: mdi:lightbulb
+        state: >-
+          {% set skip = ['none', '', 'unknown', 'unavailable'] %}
+          {% set avail = (states('sensor.guardian_lights_available') | string).split(',')
+             | map('trim') | reject('eq', '') | list %}
+          {% set sel = states('input_select.guardian_lamp_target') | string | trim %}
+          {% set saved = states('input_text.guardian_lamp_saved') | string | trim %}
+          {% set oid = sel if sel not in skip and sel in avail
+             else (saved if saved not in skip and saved in avail else '') %}
+          {{ ('light.' ~ oid) if oid else 'none' }}
+
+      # Configured presence trackers that still exist. Discovery empty/unknown
+      # leaves the helper list as-is so a boot race cannot wipe presence.
+      - name: Guardian Presence Trackers Resolved
+        unique_id: guardian_presence_trackers_resolved
+        icon: mdi:cellphone-marker
+        state: >-
+          {% set raw = states('input_text.guardian_presence_trackers') | string %}
+          {% set avail_raw = states('sensor.guardian_presence_trackers_available')
+             | string | trim %}
+          {% set configured = (raw if raw not in
+             ['', 'none', 'unknown', 'unavailable'] else '')
+             | replace(' ', '') | trim %}
+          {% set items = configured.split(',') | reject('eq', '') | list %}
+          {% if avail_raw in ['unknown', 'unavailable', ''] %}
+            {{ items | join(',') }}
+          {% else %}
+            {% set avail = avail_raw.split(',') | map('trim')
+               | reject('eq', '') | list %}
+            {{ items | select('in', avail) | list | join(',') }}
+          {% endif %}
+
+  # Which rack positions are actually programs. Trigger-based so the state
+  # template may build entity ids with Jinja: Home Assistant's listener
+  # extractor only sees a complete quoted entity id, so the entity_id: list
+  # below is the remaining unroll, exactly as the RFID occupancy sensors do it
+  # in packages/guardian_rfid.yaml. Because every helper that can change the
+  # answer is a trigger, Create Program and Delete Program show up in the panel
+  # immediately - no restart, no reload.
+  #
+  # THE only copy of the created predicate. The panel lists this sensor and
+  # binary_sensor.guardian_elevated_mode loops it; neither re-derives it.
+  #
+  # A position counts as created when its _created flag is on, OR when it
+  # carries any leftover configuration - enabled, any day, a real hour window,
+  # or a name. That second arm is a one-way migration for installs that
+  # configured programs before _created existed: it only ever adds a program to
+  # the list, never removes one, and script.guardian_delete_ss_program clears
+  # every term it tests, so a deleted position stays gone. It is not a
+  # substitute for _created - Create Program sets the flag, and a created
+  # program that is switched off and emptied still has the flag and stays
+  # visible.
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+      - trigger: state
+        entity_id:
+          - input_boolean.guardian_ss_1_created
+          - input_boolean.guardian_ss_1_enabled
+          - input_boolean.guardian_ss_1_mon
+          - input_boolean.guardian_ss_1_tue
+          - input_boolean.guardian_ss_1_wed
+          - input_boolean.guardian_ss_1_thu
+          - input_boolean.guardian_ss_1_fri
+          - input_boolean.guardian_ss_1_sat
+          - input_boolean.guardian_ss_1_sun
+          - input_text.guardian_ss_1_name
+          - input_number.guardian_ss_1_start
+          - input_number.guardian_ss_1_end
+          - input_boolean.guardian_ss_2_created
+          - input_boolean.guardian_ss_2_enabled
+          - input_boolean.guardian_ss_2_mon
+          - input_boolean.guardian_ss_2_tue
+          - input_boolean.guardian_ss_2_wed
+          - input_boolean.guardian_ss_2_thu
+          - input_boolean.guardian_ss_2_fri
+          - input_boolean.guardian_ss_2_sat
+          - input_boolean.guardian_ss_2_sun
+          - input_text.guardian_ss_2_name
+          - input_number.guardian_ss_2_start
+          - input_number.guardian_ss_2_end
+          - input_boolean.guardian_ss_3_created
+          - input_boolean.guardian_ss_3_enabled
+          - input_boolean.guardian_ss_3_mon
+          - input_boolean.guardian_ss_3_tue
+          - input_boolean.guardian_ss_3_wed
+          - input_boolean.guardian_ss_3_thu
+          - input_boolean.guardian_ss_3_fri
+          - input_boolean.guardian_ss_3_sat
+          - input_boolean.guardian_ss_3_sun
+          - input_text.guardian_ss_3_name
+          - input_number.guardian_ss_3_start
+          - input_number.guardian_ss_3_end
+          - input_boolean.guardian_ss_4_created
+          - input_boolean.guardian_ss_4_enabled
+          - input_boolean.guardian_ss_4_mon
+          - input_boolean.guardian_ss_4_tue
+          - input_boolean.guardian_ss_4_wed
+          - input_boolean.guardian_ss_4_thu
+          - input_boolean.guardian_ss_4_fri
+          - input_boolean.guardian_ss_4_sat
+          - input_boolean.guardian_ss_4_sun
+          - input_text.guardian_ss_4_name
+          - input_number.guardian_ss_4_start
+          - input_number.guardian_ss_4_end
+    sensor:
+      - name: Guardian SS Programs Created
+        unique_id: guardian_ss_programs_created
+        icon: mdi:calendar-check
+        state: >-
+          {% set days = ['mon','tue','wed','thu','fri','sat','sun'] %}
+          {% set blank = ['', 'none', 'unknown', 'unavailable'] %}
+          {% set rack = (states('sensor.guardian_ss_programs') | string).split(',')
+                        | map('trim') | reject('eq', '') | list %}
+          {% set ns = namespace(ids=[]) %}
+          {% for p in rack %}
+            {% set nm = states('input_text.guardian_ss_' ~ p ~ '_name')
+                        | string | trim | lower %}
+            {% set s = states('input_number.guardian_ss_' ~ p ~ '_start') | int(0) %}
+            {% set e = states('input_number.guardian_ss_' ~ p ~ '_end') | int(0) %}
+            {% set dns = namespace(any=false) %}
+            {% for d in days %}
+              {% if is_state('input_boolean.guardian_ss_' ~ p ~ '_' ~ d, 'on') %}
+                {% set dns.any = true %}
+              {% endif %}
+            {% endfor %}
+            {% if is_state('input_boolean.guardian_ss_' ~ p ~ '_created', 'on')
+                  or is_state('input_boolean.guardian_ss_' ~ p ~ '_enabled', 'on')
+                  or dns.any or s != e or nm not in blank %}
+              {% set ns.ids = ns.ids + [p] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ids | join(',') }}
+        attributes:
+          count: >-
+            {{ (this.state | string).split(',') | map('trim')
+               | reject('eq', '') | list | count }}
+          free: >-
+            {% set rack = (states('sensor.guardian_ss_programs') | string).split(',')
+                          | map('trim') | reject('eq', '') | list %}
+            {% set made = (this.state | string).split(',') | map('trim')
+                          | reject('eq', '') | list %}
+            {{ rack | reject('in', made) | list | count }}
+
+  - binary_sensor:
+      # THE single definition of "are we in elevated mode". Previously this
+      # expression was copy-pasted inline into four places
+      # (scripts.yaml process_rfid_scan, Unscanned Key Entry, Elevated Opening
+      # Supervisor, and inverted in Forgetful Exit Warning), which is how a
+      # clock rule came to be un-disableable: there was no entity to turn off,
+      # and nothing anywhere could trigger on a mode change.
+      #
+      # As a real entity it can be watched, so leaving elevated mode now runs
+      # cleanup instead of stranding a live PIN challenge with its timer still
+      # counting down towards a full alarm.
+      #
+      # Super surveillance is one concept: the manual boolean OR any enabled
+      # program whose weekday + hour window matches now. There is no separate
+      # night path. A wrapping window belongs to the start day of that program
+      # - see the hour helpers. Empty or disabled programs never elevate.
+      #
+      # The loop walks sensor.guardian_ss_programs_created, not the rack
+      # whitelist, so a position the household has never created - or has
+      # deleted - cannot elevate even if a stale _enabled survived on it. That
+      # sensor holds the only copy of the created predicate; do not repeat it
+      # here.
+      #
+      # now() is referenced deliberately; see the note on Guardian Doorbell Link.
+      #
+      # Quoted states() / is_state() below are so Home Assistant's listener
+      # extractor tracks every helper. Concatenating ids inside the loop is
+      # not enough - that is how a day toggle would wait for the next minute.
+      # The loop is the only copy of the window arithmetic.
+      - name: Guardian Elevated Mode
+        unique_id: guardian_elevated_mode
+        icon: mdi:shield-lock-outline
+        state: >-
+          {% set manual = is_state('input_boolean.super_surveillance_mode', 'on') %}
+          {% set h = now().hour %}
+          {% set days = ['mon','tue','wed','thu','fri','sat','sun'] %}
+          {% set today = now().weekday() %}
+          {% set yday = (today - 1) % 7 %}
+          {% set _ = [
+            states('sensor.guardian_ss_programs_created'),
+            states('input_boolean.guardian_ss_1_enabled'),
+            states('input_boolean.guardian_ss_1_mon'),
+            states('input_boolean.guardian_ss_1_tue'),
+            states('input_boolean.guardian_ss_1_wed'),
+            states('input_boolean.guardian_ss_1_thu'),
+            states('input_boolean.guardian_ss_1_fri'),
+            states('input_boolean.guardian_ss_1_sat'),
+            states('input_boolean.guardian_ss_1_sun'),
+            states('input_number.guardian_ss_1_start'),
+            states('input_number.guardian_ss_1_end'),
+            states('input_boolean.guardian_ss_2_enabled'),
+            states('input_boolean.guardian_ss_2_mon'),
+            states('input_boolean.guardian_ss_2_tue'),
+            states('input_boolean.guardian_ss_2_wed'),
+            states('input_boolean.guardian_ss_2_thu'),
+            states('input_boolean.guardian_ss_2_fri'),
+            states('input_boolean.guardian_ss_2_sat'),
+            states('input_boolean.guardian_ss_2_sun'),
+            states('input_number.guardian_ss_2_start'),
+            states('input_number.guardian_ss_2_end'),
+            states('input_boolean.guardian_ss_3_enabled'),
+            states('input_boolean.guardian_ss_3_mon'),
+            states('input_boolean.guardian_ss_3_tue'),
+            states('input_boolean.guardian_ss_3_wed'),
+            states('input_boolean.guardian_ss_3_thu'),
+            states('input_boolean.guardian_ss_3_fri'),
+            states('input_boolean.guardian_ss_3_sat'),
+            states('input_boolean.guardian_ss_3_sun'),
+            states('input_number.guardian_ss_3_start'),
+            states('input_number.guardian_ss_3_end'),
+            states('input_boolean.guardian_ss_4_enabled'),
+            states('input_boolean.guardian_ss_4_mon'),
+            states('input_boolean.guardian_ss_4_tue'),
+            states('input_boolean.guardian_ss_4_wed'),
+            states('input_boolean.guardian_ss_4_thu'),
+            states('input_boolean.guardian_ss_4_fri'),
+            states('input_boolean.guardian_ss_4_sat'),
+            states('input_boolean.guardian_ss_4_sun'),
+            states('input_number.guardian_ss_4_start'),
+            states('input_number.guardian_ss_4_end')
+          ] %}
+          {% set ns = namespace(on=false) %}
+          {% for raw in (states('sensor.guardian_ss_programs_created') | string).split(',') %}
+            {% set p = raw | trim %}
+            {% if p and is_state('input_boolean.guardian_ss_' ~ p ~ '_enabled', 'on') %}
+              {% set s = states('input_number.guardian_ss_' ~ p ~ '_start') | int(0) %}
+              {% set e = states('input_number.guardian_ss_' ~ p ~ '_end') | int(5) %}
+              {% set today_on = is_state('input_boolean.guardian_ss_' ~ p ~ '_' ~ days[today], 'on') %}
+              {% set yday_on = is_state('input_boolean.guardian_ss_' ~ p ~ '_' ~ days[yday], 'on') %}
+              {% if s != e %}
+                {% if s < e and today_on and (s <= h < e) %}
+                  {% set ns.on = true %}
+                {% elif s > e and ((today_on and h >= s) or (yday_on and h < e)) %}
+                  {% set ns.on = true %}
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ manual or ns.on }}
+
+      # Normalised doorbell reachability. The ESPHome "status" platform is the
+      # canonical signal: Home Assistant keeps that one entity available when
+      # the device drops and sets it to off, unlike every other entity on the
+      # device, which goes unavailable.
+      #
+      # The fallback matters more than it looks. That entity only exists once
+      # the doorbell has been reflashed, and the deploy order is Home Assistant
+      # first, devices afterwards - so between the restart and the flash there
+      # is a window where treating "missing" as "offline" would light a DOORBELL
+      # fault on the portal and push a false "doorbell offline" alert. Falling
+      # back to the previous proxy - any entity on the device being available
+      # means the device is talking to Home Assistant - keeps the reading honest
+      # during that window and if the status sensor is ever removed.
+      - name: Guardian Doorbell Online
+        unique_id: guardian_doorbell_online
+        device_class: connectivity
+        icon: mdi:doorbell
+        state: >-
+          {% set link = state_attr('sensor.guardian_doorbell_entities', 'link')
+             | default('', true) | string %}
+          {% set wifi = state_attr('sensor.guardian_doorbell_entities', 'wifi')
+             | default('', true) | string %}
+          {% set st = states(link) if link else 'unknown' %}
+          {% if st in ['on', 'off'] %}{{ st == 'on' }}
+          {%- else %}{{ (states(wifi) if wifi else 'unknown')
+             not in ['unknown', 'unavailable'] }}{% endif %}
+
+      # Suffix-resolved doorbell button. Home Assistant may prefix the device
+      # with an area slug (this house: eisodos_); every id still ends in
+      # smart_doorbell_doorbell_button. Iterating states.binary_sensor keeps
+      # this live on a press.
+      - name: Guardian Doorbell Button
+        unique_id: guardian_doorbell_button
+        icon: mdi:doorbell
+        state: >-
+          {% set ns = namespace(on=false) %}
+          {% for s in states.binary_sensor %}
+            {% if s.entity_id.endswith('smart_doorbell_doorbell_button')
+               and s.state == 'on' %}
+              {% set ns.on = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.on }}
+
+  # Runtime discovery. Same trigger set as sensor.guardian_notify_targets_available.
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: entity_registry_updated
+      - trigger: time_pattern
+        minutes: "/10"
+    sensor:
+      - name: Guardian Lights Available
+        unique_id: guardian_lights_available
+        icon: mdi:lightbulb-group
+        state: >-
+          {% set skip_suffixes = [
+            'guardian_interior_portal_portal_led',
+            'guardian_interior_portal_portal_backlight',
+            'smart_doorbell_doorbell_status_light'
+          ] %}
+          {% set ns = namespace(ids=[], skip=false) %}
+          {% for s in states.light %}
+            {% set ns.skip = false %}
+            {% for suf in skip_suffixes %}
+              {% if s.object_id.endswith(suf) %}
+                {% set ns.skip = true %}
+              {% endif %}
+            {% endfor %}
+            {% if not ns.skip %}
+              {% set ns.ids = ns.ids + [s.object_id] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.ids | unique | list | sort | join(',') }}
+        attributes:
+          count: >-
+            {{ (this.state | string).split(',') | map('trim')
+               | reject('eq', '') | list | count }}
+      - name: Guardian Doorbell Entities
+        unique_id: guardian_doorbell_entities
+        icon: mdi:doorbell
+        state: >-
+          {% set ns = namespace(link='', button='') %}
+          {% for s in states.binary_sensor %}
+            {% if s.entity_id.endswith('smart_doorbell_doorbell_link') %}
+              {% set ns.link = s.entity_id %}
+            {% elif s.entity_id.endswith('smart_doorbell_doorbell_button') %}
+              {% set ns.button = s.entity_id %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.link if ns.link else (ns.button if ns.button else 'none') }}
+        attributes:
+          button: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.binary_sensor %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_button') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          link: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.binary_sensor %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_link') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          wifi: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.sensor %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_wifi_signal') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          uptime: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.sensor %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_uptime') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          ip: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.sensor %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_ip_address') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          ssid: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.sensor %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_connected_ssid') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          status_light: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.light %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_status_light') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          restart: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.button %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_restart')
+                 and not s.entity_id.endswith('restart_in_safe_mode') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+          restart_safe: >-
+            {% set ns = namespace(id='') %}
+            {% for s in states.button %}
+              {% if s.entity_id.endswith('smart_doorbell_doorbell_restart_in_safe_mode') %}
+                {% set ns.id = s.entity_id %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.id }}
+      - name: Guardian Presence Trackers Available
+        unique_id: guardian_presence_trackers_available
+        icon: mdi:cellphone-marker
+        state: >-
+          {% set ns = namespace(ids=[]) %}
+          {% for s in states.device_tracker %}
+            {% set ns.ids = ns.ids + [s.entity_id] %}
+          {% endfor %}
+          {{ ns.ids | unique | list | sort | join(',') }}
+        attributes:
+          count: >-
+            {{ (this.state | string).split(',') | map('trim')
+               | reject('eq', '') | list | count }}
+
+      # What version of Guardian's BACKEND is actually running on this box.
+      #
+      # Guardian ships as loose files copied into /config: the panel under www/,
+      # the helpers and templates in packages/, the logic in scripts.yaml, the
+      # wiring in automations.yaml. Nothing makes them arrive together. A
+      # household that copies www/ and forgets scripts.yaml - or copies
+      # everything and reloads instead of restarting, so packages/ never merges
+      # - ends up running a new panel against old logic, and every symptom of
+      # that is a lie: the panel renders the new Keys screen, the Send test
+      # alert button works, and the answer comes back "this key has no phone
+      # linked" about a key that plainly has one. That mismatch cost a full
+      # debugging pass on the live house, and no amount of reading the panel
+      # could have revealed it, because the panel had no way to ask the backend
+      # what version it was.
+      #
+      # So each half now says so out loud and the panel compares them. The state
+      # is the version of THIS file. The attributes are the other three halves,
+      # each discovered rather than assumed, so a missing one reads `missing`
+      # instead of silently matching.
+      #
+      #   rfid_package  the twin sensor in packages/guardian_rfid.yaml. Absent
+      #                 means that package did not load at all - which also
+      #                 takes out sensor.guardian_rfid_slots, and with it every
+      #                 phone link, because guardian_notify_person gates on it.
+      #   scripts       scripts.yaml cannot declare a sensor, but a script's
+      #                 alias IS its friendly_name, so a marker script carries
+      #                 the version in a state machine attribute at no cost.
+      #                 Last space-separated token of the alias, by construction.
+      #   automations   presence of the persist automation (id 1786500000035).
+      #                 A version literal is not needed here: what matters is
+      #                 whether the automation that mirrors a phone link into
+      #                 its restore helper exists at all, because without it a
+      #                 restart silently drops every link in the house.
+      #
+      # Bump this literal, the twin in guardian_rfid.yaml, the marker script's
+      # alias, GUARDIAN_UI_VERSION in guardian-panel.js and the ?v= in
+      # configuration.yaml in the same commit. A disagreement is reported to the
+      # household as "these files came from different versions", which is true
+      # whether the cause is a half-finished copy or a half-finished commit.
+      - name: Guardian Version
+        unique_id: guardian_version
+        icon: mdi:tag-check-outline
+        state: '2.32.5'
+        attributes:
+          rfid_package: >-
+            {% set v = states('sensor.guardian_rfid_version') %}
+            {{ v if v not in ['unknown', 'unavailable', 'none', ''] else 'missing' }}
+          scripts: >-
+            {% set a = state_attr('script.guardian_version_marker', 'friendly_name') %}
+            {{ (a | string).split(' ') | last if a else 'missing' }}
+          # An exact entity lookup, not a scan of the automation domain. Reading
+          # states.automation here would subscribe this sensor to every
+          # automation in the house and re-render it on each one's
+          # last_triggered - a lot of work on a busy install to answer a
+          # question whose answer only changes on a restart.
+          #
+          # This used to report presence: does automation.guardian_persist_rfid_
+          # notify_targets exist, yes or no. That answered the wrong question. A
+          # stale automations.yaml from an older release still HAS that
+          # automation, so "present" was returned for the exact case this sensor
+          # exists to catch, and the panel said "Guardian is healthy" while the
+          # alarm logic came from a different version.
+          #
+          # It now reads the version out of the marker automation's
+          # friendly_name, the same way `scripts` above reads the marker
+          # script's. An automations.yaml too old to have the marker has no such
+          # entity and reports 'missing', which is the truthful answer for a
+          # file that predates the check.
+          #
+          # FOUND BY LOOKING, in the forty-first pass. This read
+          # state_attr('automation.guardian_automations_version_marker', ...),
+          # copying the idiom two attributes up - and that idiom does not
+          # transfer. A SCRIPT's entity id comes from its YAML KEY, so
+          # script.guardian_version_marker is exactly right. Automations are a
+          # LIST and have no key: Home Assistant slugifies the ALIAS, so the
+          # marker is automation.guardian_automations_version_2_25_0. The entity
+          # this looked up has never existed on any install, so this attribute
+          # has reported 'missing' since the day it was written, and More ->
+          # Diagnostics has shown a version mismatch banner on a perfectly
+          # correct deploy. DEPLOY.md step 249 is the check that would have
+          # caught it, and step 249 had never been run.
+          #
+          # Do not "fix" this by pointing at the slugified alias. That id is
+          # STICKY: the entity registry keys on the automation's id: and keeps
+          # the entity_id minted on first load, so an install that first saw
+          # 2.24.0 keeps automation.guardian_automations_version_2_24_0 through
+          # every later bump. Any lookup that embeds the version is wrong on the
+          # second release by construction. Match on the stable PREFIX instead.
+          #
+          # This does iterate the automation domain, which the previous comment
+          # here rejected on cost. Home Assistant rate-limits a template that
+          # walks a whole domain to one render a minute for exactly this reason,
+          # so the cost is bounded and the answer is at worst a minute stale
+          # after a restart - which is the correct trade against an answer that
+          # was wrong always.
+          automations: >-
+            {% set marker = states.automation
+                         | selectattr('name', 'defined')
+                         | selectattr('name', 'search',
+                                      '^Guardian - Automations Version ')
+                         | map(attribute='name') | list | first %}
+            {{ (marker | string).split(' ') | last if marker else 'missing' }}
+
+
+command_line:
+  - sensor:
+      name: Guardian Camera Luminance
+      unique_id: guardian_camera_luminance
+      # Prints one luma number. Which statistic depends on luma-run.env, written
+      # just before this update: Manual (default) is p25 of the bottom 60% after
+      # rotate=; Auto-calibrate with a ready profile is p25 over the learned
+      # mask. See guardian-luminance.py. Stdout is still a bare float so this
+      # availability regex stays the F-10 fail-closed contract.
+      # Third argument is the max age in seconds for ambient.jpg. camera.snapshot
+      # runs with continue_on_error, so without this guard a failed snapshot would
+      # cause the previous run's image to be measured and reported as current.
+      command: >-
+        python3 /config/guardian/guardian-luminance.py
+        /config/guardian/ambient.jpg 60
+      command_timeout: 15
+      scan_interval: 86400
+      unit_of_measurement: luma
+      icon: mdi:brightness-6
+      # The script prints nothing and exits non-zero on any failure. Without this
+      # availability guard, "{{ value | float }}" on empty output silently yields
+      # 0.0 - which reads as pitch dark and would switch the lamp on.
+      availability: "{{ value | trim is match('^[0-9]+(\\.[0-9]+)?$') }}"
+      value_template: "{{ value | float(0) | round(1) }}"
+  - sensor:
+      # Learned hysteresis for Auto-calibrate. Separate from
+      # input_number.guardian_dark_threshold / _bright_threshold, which belong
+      # to Manual (this home) and must not be rewritten by the calibrator.
+      # File is written by guardian-luminance.py --retune; missing file is
+      # treated as not ready (echo a stub so command_line does not log ERROR).
+      # The sampler treats ready != 1 as sun-only.
+      name: Guardian Lamp Cal
+      unique_id: guardian_lamp_cal
+      command: >-
+        cat /config/guardian/luma-cal.txt 2>/dev/null ||
+        echo '{"ready":0,"dark":0,"bright":0,"n_day":0,"n_night":0,"tiles":0}'
+      command_timeout: 5
+      scan_interval: 86400
+      icon: mdi:chart-bell-curve
+      availability: "{{ value | trim is match('^\\{\"ready\":[01]') }}"
+      value_template: "{{ value_json.ready | int(0) }}"
+      json_attributes:
+        - dark
+        - bright
+        - n_day
+        - n_night
+        - tiles
+
+# THIS USED TO BE A printf WITH A "> /config/guardian/luma-run.env" REDIRECT,
+# AND THE REDIRECT NEVER RAN ONCE.
+#
+# Home Assistant runs a shell_command whose arguments contain templates through
+# create_subprocess_exec - shell=False - so that a rendered value can never be
+# interpreted as shell syntax. That is the right call and it is not negotiable
+# from here. But with no shell there is no redirection: ">" and the path were
+# handed to printf as two more arguments, printf reused its format string for
+# them, the whole thing went to stdout, and the file was never created. printf
+# exited 0, so the shell_command reported success every time.
+#
+# guardian-luminance.py's read_run() therefore fell back to
+# mode=manual / sun=None / rotate=90 / ir=False on EVERY measurement, which
+# means Auto-calibrate, input_number.guardian_luma_rotate, the IR-frame
+# rejection and the probe's sun term were all inert for the entire life of the
+# feature. It survived unnoticed because this house's correct rotate is 90 and
+# 90 is also the fallback - a house with any other camera orientation has been
+# measuring a frame rotated the wrong way, silently, with nothing to see.
+#
+# The values stay quoted arguments, which is what exec wants and what keeps a
+# negative sun elevation from being parsed as a flag. The file write moved into
+# the probe, where it needs no shell at all.
+shell_command:
+  guardian_luma_write_run: >-
+    python3 /config/guardian/guardian-luminance.py --write-run
+    '{{ "auto" if is_state("input_select.guardian_lamp_luma_mode", "Auto-calibrate") else "manual" }}'
+    '{{ state_attr("sun.sun", "elevation") | float(0) }}'
+    '{{ states("input_number.guardian_luma_rotate") | int(90) }}'
+    '{% set ir = states("input_text.guardian_camera_ir_entity") | string | trim %}{{ 1 if ir not in ["", "none", "unknown", "unavailable"] and states(ir) not in ["unknown", "unavailable"] else 0 }}'
+  guardian_luma_retune: python3 /config/guardian/guardian-luminance.py --retune

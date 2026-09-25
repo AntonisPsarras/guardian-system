@@ -1,0 +1,23 @@
+# Home Assistant and ESPHome run on Linux; keep LF in the working tree on Windows.
+# Shell scripts in particular break under CRLF (bad interpreter / unexpected token).
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+# guardian-panel.js and set-default-panel.js are deployed to /config/www on the
+# same Linux host as everything above. They were missed here, so git offered to
+# write CRLF into them on checkout - harmless to a browser, inconsistent with
+# every other runtime file, and the kind of difference that turns up later as a
+# whole-file diff nobody meant to make.
+*.js   text eol=lf
+
+# Binary assets: never touch
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.docx binary
+*.stl  binary
+*.3mf  binary
+*.zip  binary
+*.pdf  binary

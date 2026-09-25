@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Guardian panel preview</title>
+  <!--
+    NO EXTERNAL RESOURCES. This file used to pull the Material Design Icons
+    webfont from cdn.jsdelivr.net, which was the only external hostname in the
+    whole repository.
+
+    That mattered more than a dev-harness stylesheet normally would. INSTALL.md
+    told the reader to copy all of www/guardian-ui/ into /config/www, Home
+    Assistant serves /config/www as /local with NO authentication, and so this
+    page shipped to a URL every device on the LAN and every tailnet peer could
+    open - and opening it made the security system's host resolve and fetch from
+    a third-party CDN. INSTALL.md now names the two files that deploy and
+    tools/guardian-install.sh copies only those, but the harness should not
+    reach off-box either: the whole point of this system is that it works with
+    WAN blocked, and a preview that needs the internet cannot demonstrate that.
+
+    ha-icon below therefore renders a local monogram placeholder instead of a
+    webfont glyph. This harness previews LAYOUT - box metrics, wrapping, nav
+    chrome - and a placeholder with the same dimensions previews that exactly as
+    well. tools/guardian-preflight.py fails if an external URL reappears here.
+  -->
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #e8e8ed; color: #1c1c1e;
+    }
+    #bar {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      padding: 10px 14px; background: #fff; border-bottom: 1px solid #d8d8de;
+      position: sticky; top: 0; z-index: 5;
+    }
+    #bar b { font-size: 14px; margin-right: 6px; }
+    #bar button, #bar select {
+      font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid #d0d0d6;
+      background: #f4f4f7; cursor: pointer;
+    }
+    #bar button[aria-pressed="true"] { background: #1f6b5a; color: #fff; border-color: transparent; }
+    #note { color: #6c6c70; font-size: 12px; margin-left: auto; }
+    #stage {
+      margin: 16px auto; background: #111; border-radius: 18px; overflow: hidden;
+      box-shadow: 0 12px 40px rgba(0,0,0,.18); position: relative;
+      display: flex;
+    }
+    home-assistant-main {
+      display: flex; width: 100%; height: 100%; min-width: 0; min-height: 0;
+    }
+    .fake-sidebar {
+      flex: 0 0 256px; width: 256px;
+      background: #1c1c1e; color: #f2f2f7;
+      display: flex; flex-direction: column; gap: 10px;
+      padding: 10px 8px; box-sizing: border-box;
+      border-right: 1px solid rgba(255,255,255,.08);
+    }
+    .fake-sidebar .ha-menu {
+      width: 36px; height: 36px; border-radius: 8px; display: grid; place-items: center;
+      font-size: 20px; line-height: 1; color: #8e8e93;
+    }
+    .fake-sidebar .ha-item {
+      width: 36px; height: 10px; border-radius: 4px; background: rgba(255,255,255,.12);
+    }
+    .fake-sidebar .ha-item.on { background: #46a88c; }
+    home-assistant-main[narrow] .fake-sidebar { display: none; }
+    home-assistant-main:not([narrow]):not([expanded]) .fake-sidebar {
+      flex-basis: 64px; width: 64px;
+    }
+    home-assistant-main:not([narrow]):not([expanded]) .fake-sidebar .ha-item {
+      width: 28px;
+    }
+    .fake-panel {
+      position: relative; flex: 1; min-width: 0; min-height: 0; height: 100%;
+    }
+    guardian-panel { display: block; width: 100%; height: 100%; background: transparent; }
+    ha-icon { display: inline-grid; place-items: center; width: var(--mdc-icon-size, 24px); height: var(--mdc-icon-size, 24px); }
+    /* Offline stand-in for the MDI webfont. Same box as the real glyph, so
+       every layout measurement this harness exists to check stays honest;
+       the monogram and the title attribute say which icon it stands for. */
+    ha-icon .mdi {
+      width: 100%; height: 100%; border-radius: 5px;
+      display: grid; place-items: center;
+      border: 1.5px solid currentColor; opacity: .75;
+      font-size: calc(var(--mdc-icon-size, 24px) * 0.5);
+      font-weight: 600; line-height: 1; font-family: inherit;
+      text-transform: uppercase; letter-spacing: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <b>Guardian preview</b>
+    <button data-size="phone" aria-pressed="true">Phone</button>
+    <button data-size="ipad">iPad 834</button>
+    <button data-size="ipad12">iPad 1024</button>
+    <button data-size="landscape">Landscape</button>
+    <button data-size="desktop">Desktop</button>
+    <button data-size="wide">Wide</button>
+    <button data-ha="overlay" aria-pressed="true">HA overlay</button>
+    <button data-ha="collapsed">HA collapsed</button>
+    <button data-ha="expanded">HA expanded</button>
+    <button data-theme="light" aria-pressed="true">Light</button>
+    <button data-theme="dark">Dark</button>
+    <button data-user="admin" aria-pressed="true">Admin</button>
+    <button data-user="member">Member</button>
+    <select id="scene">
+      <option value="idle">Idle</option>
+      <option value="armed">Armed</option>
+      <option value="challenge">Challenge + countdown</option>
+      <option value="doorbell-exit">Doorbell-exit phone PIN</option>
+      <option value="alarm">Alarm</option>
+      <option value="opening">Door opening (live sensor values)</option>
+      <option value="frigate">Frigate entities present</option>
+      <option value="empty">Missing hardware (clone)</option>
+      <option value="lamp-night-dark">Lamp · night, measured dark (on_camera)</option>
+      <option value="lamp-day-bright">Lamp · day, measured bright (off_camera)</option>
+      <option value="lamp-hold-night">Lamp · night, in the gap (hold)</option>
+      <option value="lamp-hold-day">Lamp · day, in the gap (off_day_hold)</option>
+      <option value="lamp-sun-override">Lamp · night, camera says bright (on_sun_override)</option>
+      <option value="lamp-dead-zone">Lamp · bright reading at −5° (holds)</option>
+      <option value="lamp-mismatch-running">Lamp · sun-mismatch clock running</option>
+      <option value="lamp-mismatch-forced">Lamp · forced by the clock (on_mismatch)</option>
+      <option value="lamp-auto-learning">Lamp · Auto-calibrate still learning</option>
+      <option value="lamp-auto-ready">Lamp · Auto-calibrate ready</option>
+      <option value="lamp-inverted">Lamp · inverted thresholds</option>
+      <option value="lamp-rotate-0">Lamp · rotate 0 (crop misses the floor)</option>
+      <option value="lamp-sampling-live">Lamp · sampling now, live luminance</option>
+      <option value="lamp-no-sample">Lamp · nothing measured yet</option>
+    </select>
+    <span id="note">Stub Home Assistant — layout only. Live camera / MQTT need a real HA.</span>
+  </div>
+  <div id="stage"></div>
+
+  <script>
+    class HaIcon extends HTMLElement {
+      static get observedAttributes() { return ['icon']; }
+      connectedCallback() { this._paint(); }
+      attributeChangedCallback() { this._paint(); }
+      _paint() {
+        // Was: '<span class="mdi mdi-' + name + '">' against the jsdelivr
+        // webfont. Now a local monogram - first letter of the icon name, or the
+        // initials either side of a hyphen (mdi:shield-home -> SH), so nav items
+        // stay distinguishable without fetching anything. Full name on hover.
+        const name = (this.getAttribute('icon') || 'mdi:circle-outline').replace(/^mdi:/, '');
+        const parts = name.split('-').filter(Boolean);
+        const mark = parts.length > 1
+          ? parts[0][0] + parts[1][0]
+          : (parts[0] || '?').slice(0, 2);
+        const span = document.createElement('span');
+        span.className = 'mdi';
+        span.textContent = mark;
+        span.title = 'mdi:' + name;
+        this.replaceChildren(span);
+      }
+    }
+    customElements.define('ha-icon', HaIcon);
+
+    const nowIso = () => new Date().toISOString();
+    const ent = (id, state, attributes = {}) => ({
+      entity_id: id, state: String(state), attributes, last_changed: nowIso(), last_updated: nowIso(),
+    });
+    const DOOR_STILL = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">'
+      + '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+      + '<stop offset="0" stop-color="#6b7c8a"/><stop offset="1" stop-color="#2c3338"/></linearGradient></defs>'
+      + '<rect width="1280" height="720" fill="url(#g)"/>'
+      + '<rect x="470" y="120" width="340" height="520" rx="8" fill="#3d2c22" stroke="#1a1410" stroke-width="8"/>'
+      + '<circle cx="760" cy="390" r="10" fill="#c9a227"/>'
+      + '<text x="640" y="80" text-anchor="middle" fill="white" font-family="sans-serif" font-size="28">Door camera (stub)</text>'
+      + '</svg>'
+    );
+
+    const SS_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+
+    /* Same created predicate as sensor.guardian_ss_programs_created in
+       packages/guardian.yaml — the flag, or leftover configuration adopted from
+       an install that predates the flag. The real one is a trigger sensor; this
+       is the harness standing in for it so Create/Delete work offline. */
+    function ssRecomputeCreated(states) {
+      const rack = String((states['sensor.guardian_ss_programs'] || {}).state || '')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      const on = (id) => (states[id] || {}).state === 'on';
+      const val = (id) => String((states[id] || {}).state || '').trim();
+      const made = rack.filter((p) => {
+        const b = 'input_boolean.guardian_ss_' + p + '_';
+        const name = val('input_text.guardian_ss_' + p + '_name').toLowerCase();
+        const start = parseInt(val('input_number.guardian_ss_' + p + '_start'), 10) || 0;
+        const end = parseInt(val('input_number.guardian_ss_' + p + '_end'), 10) || 0;
+        return on(b + 'created') || on(b + 'enabled')
+          || SS_DAYS.some((d) => on(b + d)) || start !== end
+          || ['', 'none', 'unknown', 'unavailable'].indexOf(name) < 0;
+      });
+      const cur = states['sensor.guardian_ss_programs_created'];
+      if (!cur) return;
+      cur.state = made.join(',');
+      cur.attributes = Object.assign({}, cur.attributes, {
+        count: made.length, free: rack.length - made.length,
+      });
+      cur.last_updated = nowIso();
+    }
+
+    /* Stand-ins for script.guardian_create_ss_program and
+       script.guardian_delete_ss_program, so the create/delete flow is testable
+       here. Keep in step with scripts.yaml — same defaults, same tear-down. */
+    const ssScripts = {
+      guardian_create_ss_program: (states) => {
+        const rack = String((states['sensor.guardian_ss_programs'] || {}).state || '')
+          .split(',').map((s) => s.trim()).filter(Boolean);
+        const made = String((states['sensor.guardian_ss_programs_created'] || {}).state || '')
+          .split(',').map((s) => s.trim()).filter(Boolean);
+        const free = rack.filter((p) => made.indexOf(p) < 0)[0];
+        if (!free) return;
+        const set = (id, v) => { if (states[id]) { states[id].state = v; states[id].last_updated = nowIso(); } };
+        SS_DAYS.forEach((d) => set('input_boolean.guardian_ss_' + free + '_' + d, 'on'));
+        set('input_number.guardian_ss_' + free + '_start', '0');
+        set('input_number.guardian_ss_' + free + '_end', '5');
+        set('input_text.guardian_ss_' + free + '_name', '');
+        set('input_boolean.guardian_ss_' + free + '_enabled', 'on');
+        set('input_boolean.guardian_ss_' + free + '_created', 'on');
+      },
+      guardian_delete_ss_program: (states, data) => {
+        const p = String(data.program || '').trim();
+        if (!p) return;
+        const set = (id, v) => { if (states[id]) { states[id].state = v; states[id].last_updated = nowIso(); } };
+        set('input_boolean.guardian_ss_' + p + '_created', 'off');
+        set('input_boolean.guardian_ss_' + p + '_enabled', 'off');
+        SS_DAYS.forEach((d) => set('input_boolean.guardian_ss_' + p + '_' + d, 'off'));
+        set('input_text.guardian_ss_' + p + '_name', '');
+        set('input_number.guardian_ss_' + p + '_start', '0');
+        set('input_number.guardian_ss_' + p + '_end', '0');
+      },
+      guardian_set_house_mode: (states, data) => {
+        const mode = String(data.mode || '').trim();
+        const on = data.enabled != null ? !!data.enabled : !!data.on;
+        const map = {
+          enrollment: 'input_boolean.guardian_enrollment_mode',
+          pin_change: 'input_boolean.guardian_pin_change_mode',
+          super_surveillance: 'input_boolean.super_surveillance_mode',
+        };
+        const id = map[mode];
+        if (id && states[id]) {
+          states[id].state = on ? 'on' : 'off';
+          states[id].last_changed = nowIso();
+        }
+      },
+      guardian_refresh_ha_roster: (states, data) => {
+        const set = (id, v) => { if (states[id]) { states[id].state = String(v || ''); states[id].last_updated = nowIso(); } };
+        set('input_text.guardian_ha_admin_ids', data.admin_ids);
+        set('input_text.guardian_ha_user_ids', data.user_ids);
+      },
+      guardian_slot_write: (states, data) => {
+        const slot = String(data.slot || '').trim();
+        const op = String(data.op || '').trim();
+        const raw = data.payload != null && String(data.payload) !== ''
+          ? String(data.payload)
+          : (data.value == null ? '' : String(data.value));
+        const set = (id, v) => { if (states[id]) { states[id].state = String(v); states[id].last_updated = nowIso(); } };
+        if (op === 'name') set('input_text.rfid_' + slot + '_name', raw.slice(0, 32));
+        if (op === 'notify_level') set('input_select.rfid_' + slot + '_notify_level', raw);
+        if (op === 'notify_mute') set('input_text.rfid_' + slot + '_notify_mute', raw);
+        if (op === 'notify_target') set('input_select.rfid_' + slot + '_notify_target', raw);
+        if (op === 'ha_user_id') {
+          if (raw) {
+            for (let i = 1; i <= 9; i += 1) {
+              if (String(i) === slot) continue;
+              const id = 'input_text.rfid_' + i + '_ha_user_id';
+              if (states[id] && String(states[id].state) === raw) set(id, '');
+            }
+          }
+          set('input_text.rfid_' + slot + '_ha_user_id', raw);
+        }
+        if (op === 'presence') set('input_select.rfid_' + slot, raw);
+        if (op === 'policy') set('input_select.rfid_' + slot + '_policy', raw);
+      },
+      guardian_clear_rfid_slot: () => {},
+    };
+
+    function ssProgramHelpers(id, opts) {
+      const days = SS_DAYS;
+      const onDays = opts.days || [];
+      const out = {};
+      out['input_boolean.guardian_ss_' + id + '_created'] =
+        ent('input_boolean.guardian_ss_' + id + '_created', opts.created ? 'on' : 'off');
+      out['input_boolean.guardian_ss_' + id + '_enabled'] =
+        ent('input_boolean.guardian_ss_' + id + '_enabled', opts.enabled ? 'on' : 'off');
+      days.forEach((d) => {
+        out['input_boolean.guardian_ss_' + id + '_' + d] =
+          ent('input_boolean.guardian_ss_' + id + '_' + d, onDays.indexOf(d) >= 0 ? 'on' : 'off');
+      });
+      out['input_number.guardian_ss_' + id + '_start'] =
+        ent('input_number.guardian_ss_' + id + '_start', String(opts.start), { min: 0, max: 23, step: 1 });
+      out['input_number.guardian_ss_' + id + '_end'] =
+        ent('input_number.guardian_ss_' + id + '_end', String(opts.end), { min: 0, max: 23, step: 1 });
+      out['input_text.guardian_ss_' + id + '_name'] =
+        ent('input_text.guardian_ss_' + id + '_name', opts.name || '');
+      return out;
+    }
+
+    function slotHelpers(id, name, presence, policy, notifyTarget) {
+      const empty = presence === 'empty';
+      const presenceState = empty ? 'Away' : presence;
+      const phone = notifyTarget || 'none';
+      return {
+        ['input_select.rfid_' + id]: ent('input_select.rfid_' + id, presenceState, {
+          friendly_name: 'RFID ' + id, options: ['At home', 'Away', 'Stolen/Lost'],
+        }),
+        ['input_select.rfid_' + id + '_policy']: ent('input_select.rfid_' + id + '_policy', policy, {
+          options: ['resident', 'visitor'],
+        }),
+        ['input_select.rfid_' + id + '_notify_target']: ent('input_select.rfid_' + id + '_notify_target', phone, {
+          options: ['none', 'mobile_app_phone_one', 'mobile_app_phone_two'],
+        }),
+        ['input_text.rfid_' + id + '_card_id']: ent('input_text.rfid_' + id + '_card_id',
+          empty ? '' : ('0123456789abcde' + id)),
+        ['input_text.rfid_' + id + '_hash']: ent('input_text.rfid_' + id + '_hash', ''),
+        ['input_text.rfid_' + id + '_name']: ent('input_text.rfid_' + id + '_name', name || ''),
+        ['input_text.rfid_' + id + '_ha_user_id']: ent('input_text.rfid_' + id + '_ha_user_id', ''),
+        ['input_select.rfid_' + id + '_notify_level']: ent('input_select.rfid_' + id + '_notify_level', 'Important', {
+          options: ['Important', 'Everything', 'Urgent only', 'Off'],
+        }),
+        ['input_text.rfid_' + id + '_notify_mute']: ent('input_text.rfid_' + id + '_notify_mute', ''),
+        ['input_number.rfid_' + id + '_counter']: ent('input_number.rfid_' + id + '_counter',
+          empty ? 0 : 4),
+      };
+    }
+
+    function baseStates() {
+      return {
+        'sensor.guardian_rfid_slots': ent('sensor.guardian_rfid_slots', '1,2,3,4,5,6,7,8,9'),
+        'input_text.guardian_ha_admin_ids': ent('input_text.guardian_ha_admin_ids', userRole === 'member' ? 'user-admin' : ''),
+        'input_text.guardian_ha_user_ids': ent('input_text.guardian_ha_user_ids', userRole === 'member' ? 'user-admin,user-alex' : ''),
+        'sensor.guardian_rfid_free_slots': ent('sensor.guardian_rfid_free_slots', '6'),
+        'sensor.guardian_rfid_slot_map': ent('sensor.guardian_rfid_slot_map', 'XX-X-----'),
+        'sensor.guardian_enrollment_target_slot': ent('sensor.guardian_enrollment_target_slot', '3'),
+        'sensor.guardian_presence_summary': ent('sensor.guardian_presence_summary', '1/2 home · Alex'),
+        'sensor.guardian_notify_targets_available': ent('sensor.guardian_notify_targets_available',
+          'mobile_app_phone_one,mobile_app_phone_two'),
+        'notify.mobile_app_phone_one': ent('notify.mobile_app_phone_one', 'unknown', {
+          friendly_name: "Alex's phone",
+        }),
+        'notify.mobile_app_phone_two': ent('notify.mobile_app_phone_two', 'unknown', {
+          friendly_name: "Sam's phone",
+        }),
+        'sensor.guardian_lights_available': ent('sensor.guardian_lights_available', 'tapo_lamp', { count: 1 }),
+        'input_select.guardian_lamp_target': ent('input_select.guardian_lamp_target', 'tapo_lamp', {
+          options: ['none', 'tapo_lamp'],
+        }),
+        'input_text.guardian_lamp_saved': ent('input_text.guardian_lamp_saved', 'tapo_lamp'),
+        'sensor.guardian_lamp_entity': ent('sensor.guardian_lamp_entity', 'light.tapo_lamp'),
+        'sensor.guardian_presence_trackers_available': ent('sensor.guardian_presence_trackers_available',
+          'device_tracker.phone_one,device_tracker.phone_two', { count: 2 }),
+        'sensor.guardian_presence_trackers_resolved': ent('sensor.guardian_presence_trackers_resolved', ''),
+        'device_tracker.phone_one': ent('device_tracker.phone_one', 'home', { friendly_name: 'Phone one' }),
+        'device_tracker.phone_two': ent('device_tracker.phone_two', 'not_home', { friendly_name: 'Phone two' }),
+        'binary_sensor.guardian_doorbell_button': ent('binary_sensor.guardian_doorbell_button', 'off'),
+        'sensor.guardian_doorbell_entities': ent('sensor.guardian_doorbell_entities',
+          'binary_sensor.eisodos_smart_doorbell_doorbell_link', {
+            button: 'binary_sensor.smart_doorbell_doorbell_button',
+            link: 'binary_sensor.eisodos_smart_doorbell_doorbell_link',
+            wifi: 'sensor.smart_doorbell_doorbell_wifi_signal',
+            uptime: 'sensor.smart_doorbell_doorbell_uptime',
+            ip: 'sensor.smart_doorbell_doorbell_ip_address',
+            ssid: 'sensor.smart_doorbell_doorbell_connected_ssid',
+            status_light: 'light.smart_doorbell_doorbell_status_light',
+            restart: 'button.eisodos_smart_doorbell_doorbell_restart',
+            restart_safe: 'button.eisodos_smart_doorbell_doorbell_restart_in_safe_mode',
+          }),
+        'sensor.guardian_faults': ent('sensor.guardian_faults', ''),
+        'sensor.guardian_portal_countdown_ends': ent('sensor.guardian_portal_countdown_ends', '0'),
+        'sensor.guardian_portal_countdown_total': ent('sensor.guardian_portal_countdown_total', '0'),
+        'sensor.guardian_portal_countdown_label': ent('sensor.guardian_portal_countdown_label', ''),
+        'sensor.guardian_doorbell_link': ent('sensor.guardian_doorbell_link', 'OK -58'),
+        'sensor.guardian_camera_luminance': ent('sensor.guardian_camera_luminance', 'unavailable'),
+        'sensor.guardian_lamp_cal': ent('sensor.guardian_lamp_cal', '0'),
+        'input_text.portal_display_state': ent('input_text.portal_display_state', 'IDLE'),
+        'input_number.portal_display_seq': ent('input_number.portal_display_seq', '1'),
+        'input_boolean.super_surveillance_mode': ent('input_boolean.super_surveillance_mode', 'off'),
+        'binary_sensor.guardian_elevated_mode': ent('binary_sensor.guardian_elevated_mode', 'off'),
+        // The rack is capacity; _created is what the panel lists. Program 3 is
+        // created but switched off on purpose — a disabled program must stay
+        // visible. Program 4 is an unclaimed position: no flag and no leftover
+        // configuration, so it is hidden until Create Program claims it.
+        'sensor.guardian_ss_programs': ent('sensor.guardian_ss_programs', '1,2,3,4', { count: 4 }),
+        'sensor.guardian_ss_programs_created':
+          ent('sensor.guardian_ss_programs_created', '1,2,3', { count: 3, free: 1 }),
+        ...ssProgramHelpers('1', {
+          created: true,
+          enabled: true,
+          days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'],
+          start: 0, end: 5, name: 'Weeknights',
+        }),
+        ...ssProgramHelpers('2', {
+          created: true, enabled: true, days: ['sat'], start: 14, end: 18, name: 'Weekend afternoon',
+        }),
+        ...ssProgramHelpers('3', {
+          created: true, enabled: false, days: ['sun'], start: 22, end: 6, name: 'Sunday overnight',
+        }),
+        ...ssProgramHelpers('4', {
+          created: false, enabled: false, days: [], start: 0, end: 0, name: '',
+        }),
+        'input_boolean.portal_mfa_pending': ent('input_boolean.portal_mfa_pending', 'off'),
+        'input_number.mfa_failed_attempts': ent('input_number.mfa_failed_attempts', '0'),
+        'input_boolean.guardian_entry_challenge': ent('input_boolean.guardian_entry_challenge', 'off'),
+        'input_boolean.guardian_challenge_card_ok': ent('input_boolean.guardian_challenge_card_ok', 'off'),
+        'input_boolean.guardian_challenge_pin_ok': ent('input_boolean.guardian_challenge_pin_ok', 'off'),
+        'input_boolean.guardian_doorbell_exit_pin': ent('input_boolean.guardian_doorbell_exit_pin', 'off'),
+        'input_text.guardian_challenge_origin': ent('input_text.guardian_challenge_origin', 'none'),
+        'input_number.guardian_entry_challenge_seconds': ent('input_number.guardian_entry_challenge_seconds', '30', { min: 10, max: 120, step: 5 }),
+        'input_number.guardian_doorbell_exit_pin_minutes': ent('input_number.guardian_doorbell_exit_pin_minutes', '10', { min: 2, max: 30, step: 1 }),
+        'input_text.guardian_doorbell_exit_slot': ent('input_text.guardian_doorbell_exit_slot', 'none'),
+        'input_text.guardian_alarm_reason': ent('input_text.guardian_alarm_reason', 'none'),
+        'timer.guardian_entry_window': ent('timer.guardian_entry_window', 'idle'),
+        'timer.guardian_exit_window': ent('timer.guardian_exit_window', 'idle'),
+        'timer.guardian_mfa_window': ent('timer.guardian_mfa_window', 'idle'),
+        'timer.guardian_entry_challenge': ent('timer.guardian_entry_challenge', 'idle'),
+        'timer.guardian_doorbell_exit_pin_window': ent('timer.guardian_doorbell_exit_pin_window', 'idle'),
+        'timer.guardian_enrollment_window': ent('timer.guardian_enrollment_window', 'idle'),
+        'timer.guardian_pin_change_window': ent('timer.guardian_pin_change_window', 'idle'),
+        'input_text.pending_entry_slot': ent('input_text.pending_entry_slot', 'none'),
+        'input_text.pending_exit_slot': ent('input_text.pending_exit_slot', 'none'),
+        'input_text.pending_mfa_slot': ent('input_text.pending_mfa_slot', 'none'),
+        'input_text.pending_mfa_source': ent('input_text.pending_mfa_source', 'none'),
+        'input_boolean.guardian_enrollment_mode': ent('input_boolean.guardian_enrollment_mode', 'off'),
+        'input_text.guardian_enrollment_slot': ent('input_text.guardian_enrollment_slot', ''),
+        'input_boolean.guardian_enroll_as_visitor': ent('input_boolean.guardian_enroll_as_visitor', 'off'),
+        'input_text.guardian_enroll_pending_name': ent('input_text.guardian_enroll_pending_name', ''),
+        'input_text.guardian_presence_trackers': ent('input_text.guardian_presence_trackers', ''),
+        'input_boolean.guardian_pin_change_mode': ent('input_boolean.guardian_pin_change_mode', 'off'),
+        'input_text.guardian_pin_change_step': ent('input_text.guardian_pin_change_step', 'none'),
+        'input_number.guardian_pin_change_fails': ent('input_number.guardian_pin_change_fails', '0'),
+        'input_text.portal_pin_hash': ent('input_text.portal_pin_hash', 'b'.repeat(64)),
+        'light.tapo_lamp': ent('light.tapo_lamp', 'on', {
+          brightness: 180,
+          hs_color: [30, 70],
+          rgb_color: [255, 176, 80],
+          color_temp_kelvin: 2700,
+          min_color_temp_kelvin: 2500,
+          max_color_temp_kelvin: 6500,
+          supported_color_modes: ['hs', 'color_temp'],
+          color_mode: 'hs',
+        }),
+        'input_select.guardian_lamp_luma_mode': ent('input_select.guardian_lamp_luma_mode', 'Manual (this home)', {
+          options: ['Manual (this home)', 'Auto-calibrate'],
+        }),
+        'input_boolean.guardian_lamp_sampling': ent('input_boolean.guardian_lamp_sampling', 'off'),
+        'input_text.guardian_lamp_last_result': ent('input_text.guardian_lamp_last_result', '21:14 luma=31.4 sun=-12.3 on_camera manual'),
+        'input_text.guardian_lamp_presample': ent('input_text.guardian_lamp_presample', 'none'),
+        'input_number.guardian_lamp_fail_streak': ent('input_number.guardian_lamp_fail_streak', '0'),
+        'input_text.guardian_lamp_mismatch_since': ent('input_text.guardian_lamp_mismatch_since', 'none'),
+        'input_number.guardian_lamp_mismatch_max_minutes': ent('input_number.guardian_lamp_mismatch_max_minutes', '30', { min: 10, max: 180, step: 5 }),
+        'input_number.guardian_dark_threshold': ent('input_number.guardian_dark_threshold', '45', { min: 0, max: 255, step: 1 }),
+        'input_number.guardian_bright_threshold': ent('input_number.guardian_bright_threshold', '90', { min: 0, max: 255, step: 1 }),
+        'input_number.guardian_luma_rotate': ent('input_number.guardian_luma_rotate', '90', { min: 0, max: 270, step: 90 }),
+        'sun.sun': ent('sun.sun', 'below_horizon', { elevation: -12.3 }),
+        'input_text.guardian_camera_entity': ent('input_text.guardian_camera_entity', 'camera.tapo_c110'),
+        'input_text.guardian_camera_ir_entity': ent('input_text.guardian_camera_ir_entity', 'none'),
+        'input_text.guardian_frigate_camera_name': ent('input_text.guardian_frigate_camera_name', 'door_camera'),
+        'camera.tapo_c110': ent('camera.tapo_c110', 'idle', { entity_picture: DOOR_STILL, friendly_name: 'Tapo C110' }),
+        'camera.door_camera': ent('camera.door_camera', 'idle', { entity_picture: DOOR_STILL, friendly_name: 'Door camera' }),
+        'binary_sensor.guardian_interior_portal_status': ent('binary_sensor.guardian_interior_portal_status', 'on'),
+        'binary_sensor.guardian_interior_portal_imu_healthy': ent('binary_sensor.guardian_interior_portal_imu_healthy', 'off'),
+        'binary_sensor.guardian_interior_portal_door_contact': ent('binary_sensor.guardian_interior_portal_door_contact', 'off'),
+        'binary_sensor.guardian_interior_portal_handle_depressed': ent('binary_sensor.guardian_interior_portal_handle_depressed', 'off'),
+        'binary_sensor.guardian_interior_portal_door_moving': ent('binary_sensor.guardian_interior_portal_door_moving', 'off'),
+        'sensor.guardian_interior_portal_wifi_signal': ent('sensor.guardian_interior_portal_wifi_signal', '-54'),
+        'sensor.guardian_interior_portal_uptime': ent('sensor.guardian_interior_portal_uptime', '86400'),
+        'light.guardian_interior_portal_portal_led': ent('light.guardian_interior_portal_portal_led', 'off'),
+        'light.guardian_interior_portal_portal_backlight': ent('light.guardian_interior_portal_portal_backlight', 'on'),
+        'sensor.guardian_interior_portal_handle_tilt': ent('sensor.guardian_interior_portal_handle_tilt', '1.2'),
+        'sensor.guardian_interior_portal_door_swing_rate': ent('sensor.guardian_interior_portal_door_swing_rate', '0'),
+        'sensor.guardian_interior_portal_door_swing_angle': ent('sensor.guardian_interior_portal_door_swing_angle', '0'),
+        'sensor.guardian_interior_portal_door_vibration': ent('sensor.guardian_interior_portal_door_vibration', '0.1'),
+        // Bounds are the firmware's, from esphome/portal-unit.yaml's number: block.
+        // They were 0-90 / 0-100 / 0-2000 here, which no ESP32 ever published.
+        'number.guardian_interior_portal_handle_tilt_threshold': ent('number.guardian_interior_portal_handle_tilt_threshold', '12', { min: 3, max: 45, step: 1 }),
+        'number.guardian_interior_portal_swing_rate_threshold': ent('number.guardian_interior_portal_swing_rate_threshold', '8', { min: 2, max: 40, step: 1 }),
+        'number.guardian_interior_portal_handle_lookback': ent('number.guardian_interior_portal_handle_lookback', '2500', { min: 500, max: 6000, step: 100 }),
+        'button.guardian_interior_portal_restart': ent('button.guardian_interior_portal_restart', 'unknown'),
+        'button.guardian_interior_portal_restart_in_safe_mode': ent('button.guardian_interior_portal_restart_in_safe_mode', 'unknown'),
+        'button.guardian_interior_portal_calibrate_door_rest': ent('button.guardian_interior_portal_calibrate_door_rest', 'unknown'),
+        'button.guardian_interior_portal_play_welcome': ent('button.guardian_interior_portal_play_welcome', 'unknown'),
+        'button.guardian_interior_portal_play_denied': ent('button.guardian_interior_portal_play_denied', 'unknown'),
+        'button.guardian_interior_portal_play_doorbell': ent('button.guardian_interior_portal_play_doorbell', 'unknown'),
+        'button.guardian_interior_portal_play_mfa_challenge': ent('button.guardian_interior_portal_play_mfa_challenge', 'unknown'),
+        'binary_sensor.guardian_doorbell_online': ent('binary_sensor.guardian_doorbell_online', 'on'),
+        'binary_sensor.eisodos_smart_doorbell_doorbell_link': ent('binary_sensor.eisodos_smart_doorbell_doorbell_link', 'on'),
+        'binary_sensor.smart_doorbell_doorbell_button': ent('binary_sensor.smart_doorbell_doorbell_button', 'off'),
+        'sensor.smart_doorbell_doorbell_wifi_signal': ent('sensor.smart_doorbell_doorbell_wifi_signal', '-61'),
+        'sensor.smart_doorbell_doorbell_uptime': ent('sensor.smart_doorbell_doorbell_uptime', '43200'),
+        'light.smart_doorbell_doorbell_status_light': ent('light.smart_doorbell_doorbell_status_light', 'off'),
+        'button.eisodos_smart_doorbell_doorbell_restart': ent('button.eisodos_smart_doorbell_doorbell_restart', 'unknown'),
+        'button.eisodos_smart_doorbell_doorbell_restart_in_safe_mode': ent('button.eisodos_smart_doorbell_doorbell_restart_in_safe_mode', 'unknown'),
+        'sensor.smart_doorbell_doorbell_ip_address': ent('sensor.smart_doorbell_doorbell_ip_address', '192.0.2.40'),
+        'sensor.smart_doorbell_doorbell_connected_ssid': ent('sensor.smart_doorbell_doorbell_connected_ssid', 'Home'),
+        'input_text.guardian_last_door_summary': ent('input_text.guardian_last_door_summary', 'out · 8s · 42°'),
+        'input_boolean.guardian_verbose_notifications': ent('input_boolean.guardian_verbose_notifications', 'off'),
+        'input_boolean.guardian_portal_offline_notified': ent('input_boolean.guardian_portal_offline_notified', 'off'),
+        'input_boolean.guardian_doorbell_offline_notified': ent('input_boolean.guardian_doorbell_offline_notified', 'off'),
+        'input_boolean.guest_bypass': ent('input_boolean.guest_bypass', 'off'),
+        ...slotHelpers('1', 'Alex', 'At home', 'resident', 'mobile_app_phone_one'),
+        ...slotHelpers('2', 'Sam', 'Away', 'resident'),
+        ...slotHelpers('3', '', 'empty', 'resident'),
+        ...slotHelpers('4', 'Guest', 'Away', 'visitor'),
+        ...slotHelpers('5', '', 'empty', 'resident'),
+        ...slotHelpers('6', '', 'empty', 'resident'),
+        ...slotHelpers('7', '', 'empty', 'resident'),
+        ...slotHelpers('8', '', 'empty', 'resident'),
+        ...slotHelpers('9', '', 'empty', 'resident'),
+        'input_text.rfid_1_ha_user_id': ent('input_text.rfid_1_ha_user_id',
+          userRole === 'member' ? 'user-alex' : 'user-admin'),
+        'input_text.rfid_2_ha_user_id': ent('input_text.rfid_2_ha_user_id',
+          userRole === 'member' ? 'user-sam' : 'user-alex'),
+      };
+    }
+
+    function applyScene(states, scene) {
+      const s = { ...states };
+      if (scene === 'armed') {
+        s['input_boolean.super_surveillance_mode'] = ent('input_boolean.super_surveillance_mode', 'on');
+        s['binary_sensor.guardian_elevated_mode'] = ent('binary_sensor.guardian_elevated_mode', 'on');
+      }
+      if (scene === 'challenge') {
+        const ends = (Date.now() / 1000) + 28;
+        s['input_boolean.super_surveillance_mode'] = ent('input_boolean.super_surveillance_mode', 'on');
+        s['binary_sensor.guardian_elevated_mode'] = ent('binary_sensor.guardian_elevated_mode', 'on');
+        s['input_boolean.guardian_entry_challenge'] = ent('input_boolean.guardian_entry_challenge', 'on');
+        s['input_text.guardian_challenge_origin'] = ent('input_text.guardian_challenge_origin', 'outside');
+        s['input_text.portal_display_state'] = ent('input_text.portal_display_state', 'CHALLENGE');
+        s['timer.guardian_entry_challenge'] = ent('timer.guardian_entry_challenge', 'active');
+        s['sensor.guardian_portal_countdown_ends'] = ent('sensor.guardian_portal_countdown_ends', String(ends));
+        s['sensor.guardian_portal_countdown_total'] = ent('sensor.guardian_portal_countdown_total', '30');
+        s['sensor.guardian_portal_countdown_label'] = ent('sensor.guardian_portal_countdown_label', 'ENTRY CHALLENGE');
+        s['binary_sensor.guardian_interior_portal_door_contact'] = ent('binary_sensor.guardian_interior_portal_door_contact', 'on');
+      }
+      if (scene === 'doorbell-exit') {
+        const ends = (Date.now() / 1000) + 540;
+        s['input_boolean.super_surveillance_mode'] = ent('input_boolean.super_surveillance_mode', 'on');
+        s['binary_sensor.guardian_elevated_mode'] = ent('binary_sensor.guardian_elevated_mode', 'on');
+        s['input_boolean.guardian_doorbell_exit_pin'] = ent('input_boolean.guardian_doorbell_exit_pin', 'on');
+        s['input_text.guardian_doorbell_exit_slot'] = ent('input_text.guardian_doorbell_exit_slot', '1');
+        s['input_text.portal_display_state'] = ent('input_text.portal_display_state', 'MFA');
+        s['timer.guardian_doorbell_exit_pin_window'] = ent('timer.guardian_doorbell_exit_pin_window', 'active');
+        s['sensor.guardian_portal_countdown_ends'] = ent('sensor.guardian_portal_countdown_ends', String(ends));
+        s['sensor.guardian_portal_countdown_total'] = ent('sensor.guardian_portal_countdown_total', '600');
+        s['sensor.guardian_portal_countdown_label'] = ent('sensor.guardian_portal_countdown_label', 'PHONE PIN');
+      }
+      if (scene === 'alarm') {
+        s['input_text.portal_display_state'] = ent('input_text.portal_display_state', 'ALARM');
+        s['input_text.guardian_alarm_reason'] = ent('input_text.guardian_alarm_reason', 'Entry challenge timed out');
+        s['binary_sensor.guardian_elevated_mode'] = ent('binary_sensor.guardian_elevated_mode', 'on');
+      }
+      if (scene === 'frigate') {
+        s['camera.door_camera'] = ent('camera.door_camera', 'idle', { entity_picture: DOOR_STILL, camera: 'door_camera' });
+        s['binary_sensor.door_camera_person_occupancy'] = ent('binary_sensor.door_camera_person_occupancy', 'on', { device_class: 'occupancy', camera: 'door_camera' });
+        s['image.door_camera_person'] = ent('image.door_camera_person', 'idle', { entity_picture: DOOR_STILL });
+      }
+      // Somebody is on the handle right now: the one state in which the live
+      // needles on the three Door sensing tuners have anything to point at.
+      if (scene === 'opening') {
+        s['binary_sensor.guardian_interior_portal_handle_depressed'] = ent('binary_sensor.guardian_interior_portal_handle_depressed', 'on');
+        s['binary_sensor.guardian_interior_portal_door_moving'] = ent('binary_sensor.guardian_interior_portal_door_moving', 'on');
+        s['binary_sensor.guardian_interior_portal_door_contact'] = ent('binary_sensor.guardian_interior_portal_door_contact', 'on');
+        s['sensor.guardian_interior_portal_handle_tilt'] = ent('sensor.guardian_interior_portal_handle_tilt', '21.4');
+        s['sensor.guardian_interior_portal_door_swing_rate'] = ent('sensor.guardian_interior_portal_door_swing_rate', '26.8');
+        s['sensor.guardian_interior_portal_door_swing_angle'] = ent('sensor.guardian_interior_portal_door_swing_angle', '38.2');
+        s['sensor.guardian_interior_portal_door_vibration'] = ent('sensor.guardian_interior_portal_door_vibration', '1.4');
+        s['input_text.guardian_last_door_summary'] = ent('input_text.guardian_last_door_summary', 'inside · 4s · 62°');
+      }
+      if (scene === 'empty') {
+        delete s['camera.tapo_c110'];
+        delete s['camera.door_camera'];
+        delete s['light.tapo_lamp'];
+        s['input_text.guardian_camera_entity'] = ent('input_text.guardian_camera_entity', 'camera.your_door');
+        s['binary_sensor.guardian_doorbell_online'] = ent('binary_sensor.guardian_doorbell_online', 'off');
+        s['binary_sensor.guardian_interior_portal_status'] = ent('binary_sensor.guardian_interior_portal_status', 'off');
+        s['sensor.guardian_faults'] = ent('sensor.guardian_faults', 'DOORBELL,CAMERA');
+      }
+      /* --- More -> Lamp, as a debug gallery ------------------------------
+       * Every one of these is a state the sampler in scripts.yaml can really be
+       * in, so the verdict the panel prints can be checked against the tree by
+       * hand. Bounds match packages/guardian.yaml for the same reason the
+       * ESPHome numbers above do. */
+      const lamp = (o) => {
+        if (o.sun !== undefined) {
+          s['sun.sun'] = ent('sun.sun', o.sun < 0 ? 'below_horizon' : 'above_horizon', { elevation: o.sun });
+        }
+        if (o.result !== undefined) {
+          s['input_text.guardian_lamp_last_result'] = ent('input_text.guardian_lamp_last_result', o.result);
+        }
+        if (o.on !== undefined) {
+          s['light.tapo_lamp'] = ent('light.tapo_lamp', o.on ? 'on' : 'off', {
+            ...s['light.tapo_lamp'].attributes,
+          });
+        }
+        if (o.luma !== undefined) {
+          s['sensor.guardian_camera_luminance'] = ent('sensor.guardian_camera_luminance', o.luma);
+        }
+        if (o.dark !== undefined) {
+          s['input_number.guardian_dark_threshold'] = ent('input_number.guardian_dark_threshold',
+            String(o.dark), { min: 0, max: 255, step: 1 });
+        }
+        if (o.bright !== undefined) {
+          s['input_number.guardian_bright_threshold'] = ent('input_number.guardian_bright_threshold',
+            String(o.bright), { min: 0, max: 255, step: 1 });
+        }
+        if (o.rotate !== undefined) {
+          s['input_number.guardian_luma_rotate'] = ent('input_number.guardian_luma_rotate',
+            String(o.rotate), { min: 0, max: 270, step: 90 });
+        }
+        if (o.mode !== undefined) {
+          s['input_select.guardian_lamp_luma_mode'] = ent('input_select.guardian_lamp_luma_mode', o.mode, {
+            options: ['Manual (this home)', 'Auto-calibrate'],
+          });
+        }
+        if (o.cal !== undefined) {
+          s['sensor.guardian_lamp_cal'] = ent('sensor.guardian_lamp_cal', String(o.cal.ready), o.cal);
+        }
+        if (o.mismatchMin !== undefined) {
+          s['input_text.guardian_lamp_mismatch_since'] = ent('input_text.guardian_lamp_mismatch_since',
+            String((Date.now() / 1000) - (o.mismatchMin * 60)));
+        }
+        if (o.sampling) {
+          s['input_boolean.guardian_lamp_sampling'] = ent('input_boolean.guardian_lamp_sampling', 'on');
+          s['input_text.guardian_lamp_presample'] = ent('input_text.guardian_lamp_presample', 'on|180|2700');
+        }
+        if (o.failStreak !== undefined) {
+          s['input_number.guardian_lamp_fail_streak'] = ent('input_number.guardian_lamp_fail_streak',
+            String(o.failStreak), { min: 0, max: 99, step: 1 });
+        }
+      };
+
+      // luma 31.4 is under dark 45, and the sun is well down: the ordinary case.
+      if (scene === 'lamp-night-dark') lamp({ sun: -12.3, on: true, result: '21:14 luma=31.4 sun=-12.3 on_camera manual' });
+      // luma 118 is over bright 90 with the sun well up.
+      if (scene === 'lamp-day-bright') lamp({ sun: 42.3, on: false, result: '13:44 luma=118.2 sun=42.3 off_camera manual' });
+      // The failure the mismatch clock exists for: a window parks luma in the gap all night.
+      if (scene === 'lamp-hold-night') lamp({ sun: -9.4, on: false, result: '22:20 luma=62.7 sun=-9.4 hold manual' });
+      // Same reading by day leaves the lamp off rather than restoring it.
+      if (scene === 'lamp-hold-day') lamp({ sun: 33.1, on: false, result: '11:02 luma=62.7 sun=33.1 off_day_hold manual' });
+      // IR flooding a dark scene: the camera is wrong, and which way is known.
+      if (scene === 'lamp-sun-override') lamp({ sun: -12.3, on: true, result: '23:05 luma=146.0 sun=-12.3 on_sun_override manual' });
+      // Between -6 and -3 a bright reading is not trusted either. This holds.
+      if (scene === 'lamp-dead-zone') lamp({ sun: -4.6, on: false, result: '20:41 luma=131.5 sun=-4.6 hold manual' });
+      if (scene === 'lamp-mismatch-running') lamp({ sun: -11.2, on: false, mismatchMin: 12, result: '22:40 luma=58.1 sun=-11.2 hold manual' });
+      if (scene === 'lamp-mismatch-forced') lamp({ sun: -11.2, on: true, result: '23:10 luma=58.1 sun=-11.2 on_mismatch' });
+      if (scene === 'lamp-auto-learning') {
+        lamp({
+          mode: 'Auto-calibrate', sun: -12.3, on: true,
+          cal: { ready: 0, dark: 0, bright: 0, n_day: 3, n_night: 5, tiles: 9 },
+          result: '21:14 sun=-12.3 on_sun learn',
+        });
+      }
+      if (scene === 'lamp-auto-ready') {
+        lamp({
+          mode: 'Auto-calibrate', sun: -12.3, on: true,
+          cal: { ready: 1, dark: 38, bright: 96, n_day: 14, n_night: 11, tiles: 22 },
+          result: '21:14 luma=29.8 sun=-12.3 on_camera auto',
+        });
+      }
+      if (scene === 'lamp-inverted') lamp({ dark: 120, bright: 60, sun: -12.3, on: true, result: '21:14 luma=31.4 sun=-12.3 hold manual' });
+      if (scene === 'lamp-rotate-0') lamp({ rotate: 0, sun: -12.3, on: false, result: '22:20 luma=62.7 sun=-12.3 hold manual' });
+      if (scene === 'lamp-sampling-live') lamp({ sampling: true, luma: '31.4', sun: -12.3, on: false });
+      if (scene === 'lamp-no-sample') lamp({ result: 'none', sun: -12.3, on: false, failStreak: 3 });
+
+      return s;
+    }
+
+    const sizes = {
+      phone: [390, 844],
+      ipad: [834, 1194],
+      ipad12: [1024, 1366],
+      landscape: [1080, 810],
+      desktop: [1280, 860],
+      wide: [1440, 900],
+    };
+    const defaultHa = {
+      phone: 'overlay',
+      ipad: 'expanded',
+      ipad12: 'expanded',
+      landscape: 'expanded',
+      desktop: 'expanded',
+      wide: 'expanded',
+    };
+
+    let size = 'phone';
+    let userRole = 'admin';
+    let haMode = 'overlay';
+    let dark = false;
+    let scene = 'idle';
+    let panelEl = null;
+
+    function stubHistory(startIso, endIso) {
+      const start = Date.parse(startIso);
+      const end = Date.parse(endIso);
+      const inWin = (ms) => Number.isFinite(ms) && ms >= start && ms <= end;
+      const lu = (ms) => ms / 1000;
+      const atDaysAgo = (daysAgo, hour, minute) => {
+        const d = new Date();
+        d.setDate(d.getDate() - daysAgo);
+        d.setHours(hour, minute, 0, 0);
+        return d.getTime();
+      };
+      const startToday = new Date();
+      startToday.setHours(0, 0, 0, 0);
+      const todayEvent = Math.max(startToday.getTime() + 60000, Date.now() - 90 * 60 * 1000);
+
+      const door = [];
+      const display = [];
+      const add = (list, t, s) => { if (inWin(t)) list.push({ s, lu: lu(t) }); };
+
+      add(door, atDaysAgo(3, 10, 0), 'off');
+      add(door, atDaysAgo(3, 10, 1), 'on');
+      add(door, atDaysAgo(3, 10, 2), 'off');
+      add(display, atDaysAgo(3, 10, 0), 'IDLE');
+      add(display, atDaysAgo(3, 10, 1), 'GRANTED');
+      add(display, atDaysAgo(3, 10, 2), 'IDLE');
+
+      add(door, atDaysAgo(1, 15, 30), 'off');
+      add(door, atDaysAgo(1, 15, 31), 'on');
+      add(door, atDaysAgo(1, 15, 32), 'off');
+
+      add(door, todayEvent, 'off');
+      add(door, todayEvent + 5000, 'on');
+      add(door, todayEvent + 25000, 'off');
+      add(display, todayEvent, 'IDLE');
+      add(display, todayEvent + 5000, 'GRANTED');
+      add(display, todayEvent + 25000, 'IDLE');
+
+      for (let i = 1; i <= 8; i++) {
+        const t = todayEvent - i * 8 * 60 * 1000;
+        add(door, t, 'off');
+        add(door, t + 5000, 'on');
+        add(door, t + 25000, 'off');
+        add(display, t, 'IDLE');
+        add(display, t + 5000, 'GRANTED');
+        add(display, t + 25000, 'IDLE');
+      }
+
+      const seed = (pts, fallback) => {
+        const sorted = pts.slice().sort((a, b) => a.lu - b.lu);
+        if (!sorted.length) return [];
+        const firstMs = sorted[0].lu * 1000;
+        const baseline = Math.max(start, firstMs - 1000);
+        return [{ s: fallback, lu: lu(baseline) }, ...sorted];
+      };
+
+      return {
+        'binary_sensor.guardian_interior_portal_door_contact': seed(door, 'off'),
+        'input_text.portal_display_state': seed(display, 'IDLE'),
+      };
+    }
+
+    function makeHass() {
+      const admin = userRole !== 'member';
+      return {
+        user: admin
+          ? { id: 'user-admin', name: 'Owner', is_admin: true, is_owner: true }
+          : { id: 'user-alex', name: 'Alex', is_admin: false, is_owner: false },
+        states: applyScene(baseStates(), scene),
+        themes: { darkMode: dark },
+        locale: { time_format: '24' },
+        panels: scene === 'frigate' ? { ccab4aaf_frigate: { title: 'Frigate' } } : {},
+        callService: async (domain, service, data, target) => {
+          console.info('[preview] callService', domain, service, data, target);
+          if (domain === 'script' && panelEl && panelEl.hass
+              && ssScripts[service]) {
+            ssScripts[service](panelEl.hass.states, data || {});
+            ssRecomputeCreated(panelEl.hass.states);
+            panelEl.hass = panelEl.hass;
+            return;
+          }
+          const id = (target && target.entity_id) || (data && data.entity_id);
+          if (!id || !panelEl || !panelEl.hass) return;
+          const states = panelEl.hass.states;
+          const ids = Array.isArray(id) ? id : [id];
+          ids.forEach((eid) => {
+            const cur = states[eid];
+            if (!cur) return;
+            if (domain === 'input_boolean' && (service === 'turn_on' || service === 'turn_off')) {
+              cur.state = service === 'turn_on' ? 'on' : 'off';
+              cur.last_changed = nowIso();
+            } else if ((domain === 'input_number' || domain === 'number') && service === 'set_value') {
+              cur.state = String(data.value);
+              cur.last_updated = nowIso();
+            } else if (domain === 'input_text' && service === 'set_value') {
+              cur.state = String(data.value == null ? '' : data.value);
+              cur.last_updated = nowIso();
+            } else if (domain === 'input_select' && service === 'select_option') {
+              // Rejects an option outside the list, exactly as Home Assistant
+              // does. The Alerts go to picker depends on that failure being
+              // visible: without it the harness could never reproduce a browser
+              // showing a phone the backend never accepted.
+              const opts = (cur.attributes && cur.attributes.options) || [];
+              const want = String(data.option);
+              if (opts.indexOf(want) < 0) {
+                throw new Error('Invalid option: ' + want + ' (possible options: ' + opts.join(', ') + ')');
+              }
+              cur.state = want;
+              cur.last_changed = nowIso();
+              cur.last_updated = nowIso();
+            }
+          });
+          panelEl.hass = panelEl.hass;
+        },
+        callWS: async (msg) => {
+          if (msg && msg.type === 'history/history_during_period') {
+            return stubHistory(msg.start_time, msg.end_time);
+          }
+          if (msg && msg.type === 'call_service'
+              && msg.service === 'guardian_notify_test') {
+            // Mirrors script.guardian_notify_test: whatever that slot's
+            // selector currently reads, or a skip when it reads none.
+            const slot = String((msg.service_data || {}).slot || '');
+            const t = String(((panelEl && panelEl.hass && panelEl.hass.states[
+              'input_select.rfid_' + slot + '_notify_target']) || {}).state || 'none');
+            const linked = ['none', '', 'unknown', 'unavailable'].indexOf(t) < 0;
+            const known = linked && !!(panelEl.hass.states['notify.' + t]);
+            return {
+              response: {
+                decision: linked && known ? 'person' : 'skip',
+                // Same two skip reasons the script returns: nothing picked, or
+                // a phone picked whose notify target no longer exists.
+                reason: linked && known ? '' : (linked ? 'not_registered' : 'not_selected'),
+                target: t,
+                recipients: linked && known ? t : '',
+                recipient_count: linked && known ? 1 : 0,
+              },
+            };
+          }
+          if (msg && msg.type === 'config/auth/list') {
+            return [
+              { id: 'user-admin', name: 'Owner', is_owner: true, is_active: true, group_ids: ['system-admin'] },
+              { id: 'user-alex', name: 'Alex', is_owner: false, is_active: true, group_ids: ['system-users'] },
+              { id: 'user-hass-content', name: 'Home Assistant Content',
+                is_owner: false, is_active: true, system_generated: true, group_ids: [] },
+            ];
+          }
+          if (msg && msg.type === 'media_source/browse_media') {
+            const err = new Error('No Frigate media source in preview');
+            err.code = 'unknown_error';
+            throw err;
+          }
+          return {};
+        },
+        connection: {
+          subscribeEvents: async () => () => {},
+        },
+      };
+    }
+
+    function mount() {
+      const stage = document.getElementById('stage');
+      const [w, h] = sizes[size];
+      stage.style.width = w + 'px';
+      stage.style.height = h + 'px';
+      stage.innerHTML = '';
+
+      const main = document.createElement('home-assistant-main');
+      if (haMode === 'overlay') main.setAttribute('narrow', '');
+      if (haMode === 'expanded') main.setAttribute('expanded', '');
+
+      const sidebar = document.createElement('aside');
+      sidebar.className = 'fake-sidebar';
+      sidebar.innerHTML = '<div class="ha-menu" aria-hidden="true">☰</div>'
+        + '<div class="ha-item on"></div><div class="ha-item"></div>'
+        + '<div class="ha-item"></div><div class="ha-item"></div>';
+
+      const host = document.createElement('div');
+      host.className = 'fake-panel';
+
+      panelEl = document.createElement('guardian-panel');
+      panelEl.panel = { config: { camera: 'camera.door_camera', lamp: 'light.tapo_lamp', historyHours: 24 } };
+      host.appendChild(panelEl);
+      main.appendChild(sidebar);
+      main.appendChild(host);
+      stage.appendChild(main);
+      panelEl.hass = makeHass();
+    }
+
+    document.getElementById('bar').addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      if (btn.dataset.size) {
+        size = btn.dataset.size;
+        haMode = defaultHa[size] || 'overlay';
+        document.querySelectorAll('[data-size]').forEach((b) => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
+        document.querySelectorAll('[data-ha]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.ha === haMode ? 'true' : 'false'));
+        mount();
+      }
+      if (btn.dataset.ha) {
+        haMode = btn.dataset.ha;
+        document.querySelectorAll('[data-ha]').forEach((b) => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
+        mount();
+      }
+      if (btn.dataset.theme) {
+        dark = btn.dataset.theme === 'dark';
+        document.querySelectorAll('[data-theme]').forEach((b) => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
+        mount();
+      }
+      if (btn.dataset.user) {
+        userRole = btn.dataset.user;
+        document.querySelectorAll('[data-user]').forEach((b) => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
+        mount();
+      }
+    });
+    document.getElementById('scene').addEventListener('change', (e) => {
+      scene = e.target.value;
+      mount();
+    });
+
+    import('./guardian-panel.js?v=2.32.5').then(mount);
+  </script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+# READ THIS BEFORE YOU START FRIGATE.
+#
+# THIS IS A TEMPLATE. Copy it to frigate/config.yml (which is gitignored) or
+# straight into the Frigate add-on's config directory, and edit the copy - never
+# this file. Only the .example is tracked.
+#
+# The {NAME} placeholders in this file are Frigate's environment-variable
+# substitution, and on a Home Assistant OS add-on install they very often DO NOT
+# WORK. Frigate only expands a placeholder whose variable is actually present in
+# its container environment, and the add-on's configuration schema gives you no
+# supported place to put one. There is no warning when it fails: the literal
+# text "{FRIGATE_RTSP_USER}" is passed to ffmpeg as the username, and every
+# stream fails to authenticate.
+#
+# If Frigate logs an authentication error, or Debug shows "No frames have been
+# received", look at the URL it printed. If the placeholder is still there
+# verbatim, substitution did not happen — and the fix is to HARDCODE the values
+# directly into the go2rtc URLs at the bottom of this file:
+#
+#   rtsp://myuser:mypassword@192.168.0.99/stream1
+#
+# Do the same in the mqtt: block below if your broker needs credentials.
+#
+# That is the working configuration for most installs, and it is fine — as long
+# as you understand what you are accepting:
+#
+#   * Put the credentials in your COPY, never in this file. frigate/config.yml
+#     is gitignored; frigate/config.yml.example - the one you are reading - is
+#     tracked, so anything typed in here gets committed and then lives in git
+#     history permanently, with rewriting history the only way out. (This used to
+#     be the tracked config itself, with a note telling you to gitignore it
+#     before editing. Splitting the two is what actually fixes that.)
+#   * Give the camera a dedicated account with a password used nowhere else.
+#     Most cameras support this. A hardcoded throwaway credential is a much
+#     smaller problem than a hardcoded reused one.
+#
+# Placeholders are kept here as the default because they are the safer shape
+# when they do work — for example a Docker/Compose install, where you control
+# the environment directly. They are not kept because they are reliable here.
+#
+# The three the camera URLs want are:
+#
+#   FRIGATE_RTSP_USER      camera account name
+#   FRIGATE_RTSP_PASSWORD  camera account password
+#   FRIGATE_CAMERA_HOST    camera IP or hostname, e.g. 192.168.x.x
+#
+# These were previously inline in plaintext, along with the internal IP. If those
+# were the real credentials, rotate them: they are in this file's git history.
+# Live view and detect are the camera's native landscape JPEG. The door lamp
+# mount is 90° CCW (floor on the left). Lamp luminance rotates that still in
+# guardian-luminance.py (input_number.guardian_luma_rotate) rather than
+# transcoding here. That helper starts at 0 on a fresh install and the setup
+# wizard does not guess it, so set it to 90 by hand for this mount; 90 is only
+# the fallback the script uses when the helper cannot be read at all. To upright Frigate detect/live as well, add a second
+# go2rtc ffmpeg producer with #rotate=270 (90° CW) and accept the CPU cost.
+# MQTT is REDACTED from this copy, not absent by design. Guardian's two Frigate
+# automations — "Guardian: Frigate Person Detected While Away" and its data-log
+# twin — are `trigger: mqtt` on `frigate/events`. Frigate publishes that topic
+# only when it has an mqtt: block, so on a fresh copy of this file both
+# automations are inert and person detection never fires.
+#
+# Uncomment and fill in for your own broker (Mosquitto add-on, or whatever the
+# MQTT integration in Home Assistant points at). Home Assistant needs the MQTT
+# integration configured against the SAME broker, or it will never see what
+# Frigate publishes.
+#
+# topic_prefix must stay `frigate` unless you also change the topic in both
+# automations — an MQTT trigger topic is not templatable, so it cannot be read
+# from a helper the way the camera name is.
+#
+# mqtt:
+#   enabled: true
+#   host: 192.168.0.2          # your broker, usually the Home Assistant host
+#   port: 1883
+#   topic_prefix: frigate
+#   client_id: frigate
+#   user: "{FRIGATE_MQTT_USER}"
+#   password: "{FRIGATE_MQTT_PASSWORD}"
+#
+# The same placeholder warning applies here as to the RTSP URLs above: on a Home
+# Assistant OS add-on install these almost certainly will not expand, and you
+# will need to type the broker username and password in directly.
+#
+# DO give the broker credentials. Earlier revisions of this file said an
+# unauthenticated broker on your own LAN needs neither line — that was wrong, and
+# not for the obvious reason. A broker with allow_anonymous true lets any device
+# on the LAN connect to port 1883 and:
+#
+#   * publish forged frigate/events, which drives Guardian's two person-detection
+#     automations (a broadcast push and a data-log line — noise, not an alarm);
+#   * subscribe to everything the broker carries;
+#   * publish to homeassistant/# discovery topics, which lets an unauthenticated
+#     LAN device create arbitrary entities inside Home Assistant. That is the one
+#     that actually matters.
+#
+# Set allow_anonymous false in the Mosquitto add-on and give Frigate and Home
+# Assistant one account each. If you leave the broker open anyway, understand
+# that you are trusting every device on the WiFi — including the ones you did not
+# choose and cannot patch.
+#
+# Do not leave empty placeholders behind: Frigate will try to use a leftover
+# {...} as a literal username.
+#
+# The camera key below (door_camera) must match
+# input_text.guardian_frigate_camera_name in Home Assistant. A mismatch is a
+# silent false negative: the topic arrives, the condition never matches, and
+# nothing anywhere reports it (audit F-15).
+cameras:
+  door_camera:
+    enabled: true
+    friendly_name: Door Camera
+    ffmpeg:
+      inputs:
+        # Pulled from go2rtc's restream below, not directly from the camera.
+        # Frigate pulling stream1/stream2 itself while go2rtc *also* pulls
+        # them for live view opens 4 concurrent RTSP sessions to one camera;
+        # most cameras cap concurrent clients well below that, and once the
+        # limit is hit the detect connection dies and never recovers on its
+        # own (confirmed: "No frames have been received" in Debug, and
+        # "Too many unprocessed recording segments... issue with the detect
+        # stream" logged continuously with no recovery). Routing through
+        # go2rtc means every consumer shares one connection per substream.
+        - path: rtsp://127.0.0.1:8554/door_camera_1
+          roles:
+            - record
+        - path: rtsp://127.0.0.1:8554/door_camera_2
+          roles:
+            - detect
+    detect:
+      enabled: true
+      width: 640
+      height: 360
+      fps: 5
+    objects:
+      track:
+        - person
+    record:
+      enabled: true
+
+      # Do not retain general continuous footage
+      continuous:
+        days: 0
+
+      # Do not retain footage merely because generic motion occurred
+      motion:
+        days: 0
+
+      # Keep person alerts for 14 days
+      alerts:
+        retain:
+          days: 14
+          mode: active_objects
+
+      # Keep lower-priority person detections for 7 days
+      detections:
+        retain:
+          days: 7
+          mode: active_objects
+
+    snapshots:
+      enabled: true
+      timestamp: true
+      bounding_box: true
+      crop: false
+      retain:
+        default: 14
+    live:
+      streams:
+        Stream 1: door_camera_1
+        Stream 2: door_camera_2
+version: 0.17-0
+go2rtc:
+  streams:
+    door_camera_1:
+      - rtsp://{FRIGATE_RTSP_USER}:{FRIGATE_RTSP_PASSWORD}@{FRIGATE_CAMERA_HOST}/stream1
+    door_camera_2:
+      - rtsp://{FRIGATE_RTSP_USER}:{FRIGATE_RTSP_PASSWORD}@{FRIGATE_CAMERA_HOST}/stream2

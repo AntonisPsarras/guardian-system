@@ -1,0 +1,122 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder.
+# extra_module_url is the one-shot that makes Guardian the system landing
+# page (core.default_panel). Settings → Dashboards cannot list a
+# panel_custom, so this is the supported equivalent of "Set as default".
+# CACHE: same rule as module_url below — bump ?v= with GUARDIAN_UI_VERSION.
+frontend:
+  themes: !include_dir_merge_named themes
+  extra_module_url:
+    - /local/guardian-ui/set-default-panel.js?v=2.32.5
+
+# The Home Assistant login is the outer gate in front of everything Guardian
+# can do. Guardian scripts also refuse some writes from a second account
+# (see packages/guardian.yaml roster helpers), but Home Assistant still has
+# no general per-service ACL: Developer Tools can still call
+# input_text.set_value. Hand out administrator rights on that basis.
+# Without this block Home Assistant runs on its defaults, which are
+# ip_ban_enabled: false and login_attempts_threshold: -1:
+# unlimited password guesses, at full speed, with no lockout and no ban.
+#
+# That matters here specifically because the threat model assumes the LAN may be
+# hostile (a guest-network misconfig, a breached IoT device) and because remote
+# access is Tailscale, where every tailnet peer can reach port 8123 directly.
+#
+# Bans are written to /config/ip_bans.yaml and are removed by deleting the entry
+# there and restarting. Lock yourself out and that file is the way back in.
+#
+# server_host is deliberately NOT set. Binding to the Tailscale interface alone
+# would break the Companion app and every browser on the LAN; interface-level
+# restriction belongs at the OS firewall, not here.
+http:
+  ip_ban_enabled: true
+  login_attempts_threshold: 5
+
+# Keep credential-shaped helpers out of the recorder database.
+#
+# input_text.portal_pin_hash holds an unsalted, single-round SHA-256 of a 4-6
+# digit PIN. That keyspace is 10^4-10^6, so the hash is reversible in
+# milliseconds - it is not a one-way function in any practical sense. Recorded,
+# it lands in home-assistant_v2.db and therefore in every backup ever taken, and
+# a backup travels to places the PIN should not (a NAS, a USB stick, a cloud
+# sync). The card ids are the same shape of problem.
+#
+# input_text.rfid_*_hash is the third, and this list stopped one glob short of
+# it for its whole existence. It holds an unsalted sha256 of a raw card UID -
+# legacy now, since enrollment writes card ids and guardian_reset wipes these,
+# but still populated on any install migrated from before that change. A 4-byte
+# MIFARE Classic UID is a 2^32 keyspace, which is a WEAKER hash than the PIN
+# this block already excludes for exactly this reasoning, and recovering it
+# yields the UID that clones the card. A half-complete exclusion list reads
+# exactly like a complete one, which is why this is spelled out rather than
+# quietly added.
+#
+# Excluding them costs nothing: the Guardian panel's Activity view reads
+# input_select.rfid_N for presence, never these three (see historyEntities() in
+# guardian-panel.js). Everything else recorder does is unchanged.
+recorder:
+  exclude:
+    entities:
+      - input_text.portal_pin_hash
+    entity_globs:
+      - input_text.rfid_*_card_id
+      - input_text.rfid_*_hash
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# Guardian control panel — a second, deliberately designed UI layer over the
+# Guardian security system. See GUARDIAN_UI.md.
+#
+# This is the household LANDING surface (system default_panel: guardian), not
+# a replacement of Home Assistant: Settings, Developer Tools, Overview /
+# Home, Lights, Energy, Frigate and the rest stay in the sidebar exactly as
+# they are. The panel reads entity state and calls existing helpers and
+# scripts; it contains no business logic of its own.
+#
+# require_admin: false on purpose — a household member who is not a Home
+# Assistant administrator can use Keys and Notifications. House-level
+# mutation is refused by Guardian scripts once a second account exists;
+# Developer Tools can still write helpers directly, which is Home
+# Assistant's model. Press-and-hold is stray-tap protection, not a lock.
+#
+# CACHE: Home Assistant serves /config/www as /local with long cache headers,
+# so the ?v= below (and on extra_module_url above) is what makes a browser
+# pick up a new build. Bump both query strings and GUARDIAN_UI_VERSION in
+# guardian-panel.js together, in the same commit.
+panel_custom:
+  - name: guardian-panel
+    sidebar_title: Guardian
+    sidebar_icon: mdi:shield-home
+    url_path: guardian
+    module_url: /local/guardian-ui/guardian-panel.js?v=2.32.5
+    require_admin: false
+    config:
+      # Fallback for live view when the helper is empty. Live view and lamp
+      # sampling both prefer camera.door_camera when that entity exists and
+      # the helper still holds the old camera.tapo_c110 sentinel.
+      camera: camera.door_camera
+      # Optional. Fallback the panel uses if sensor.guardian_lamp_entity is
+      # still none. Automations and scripts consume the discovery sensor, not
+      # this id, so leaving it out is fine: the Lamp page then says which
+      # light to pick. Set it to your own bulb to skip that step.
+      # lamp: light.your_lamp
+      # How far back the Activity view reads recorder history, in hours.
+      historyHours: 24
+      # Optional. If empty, the panel looks for a sidebar item named Frigate.
+      # frigatePath: ccab4aaf_frigate
+
+homeassistant:
+  packages: !include_dir_named packages
+  # Also declared inside packages/guardian.yaml. Duplicated here on purpose:
+  # allowlist_external_dirs set from *inside* a package has been unreliable
+  # to merge into the core homeassistant: domain across HA versions, since
+  # configuration.yaml already defines homeassistant: directly (for
+  # packages: above) rather than picking it up entirely from a package.
+  # Declaring it here too guarantees it takes effect regardless of that.
+  allowlist_external_dirs:
+    - /config
