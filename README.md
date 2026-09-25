@@ -11,13 +11,23 @@ working system.
 > A burglar alarm that fails does so at the worst possible moment. Read the
 > caveats below before you run it. MIT, **as is, without warranty**.
 
-<p>
-<img src="docs/documentation/interior-portal/images/readme.jpg" alt="Interior portal mounted on the wall: speaker, display, and keypad" width="32%">
-<img src="docs/documentation/doorbell/images/readme.jpg" alt="Outdoor doorbell mounted on the wall: white housing with a bell mark" width="32%">
-<img src="docs/documentation/door-lamp-camera/images/01.jpg" alt="Finished door lamp and camera housing mounted on a wall" width="32%">
-</p>
+<table>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/documentation/interior-portal/images/readme.jpg" alt="Interior portal mounted on the wall" />
+      <br /><strong>Interior portal</strong>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/documentation/doorbell/images/readme.jpg" alt="Outdoor doorbell mounted on the wall" />
+      <br /><strong>Doorbell</strong>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="docs/documentation/door-lamp-camera/images/readme.jpg" alt="Door lamp and camera housing" />
+      <br /><strong>Door lamp</strong>
+    </td>
+  </tr>
+</table>
 
-Interior portal · outdoor doorbell · door lamp with hidden camera.
 Step-by-step assembly with more photographs is in
 [`docs/documentation/`](docs/documentation/).
 
