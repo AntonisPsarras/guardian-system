@@ -16,7 +16,7 @@ The doorbell module combines 3D-printed parts and a custom PCB. The PCB supports
 
 |   |
 | --- |
-| **3D-printing requirement:** Print `Doorbell-Final.3mf` from MakerWorld or Printables (see [`3D-Models/README.md`](../../../3D-Models/README.md)), in PETG. Supports are already part of the models. |
+| **3D-printing requirement:** Print `Doorbell-Final.3mf` from [MakerWorld](https://makerworld.com/en/models/3347498-guardian-outdoor-doorbell-housing-esp32-c6) or [Printables](https://www.printables.com/model/1853742-guardian-outdoor-doorbell-housing-esp32-c6), in PETG. Supports are already part of the models. |
 
 |   |
 | --- |

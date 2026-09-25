@@ -16,7 +16,7 @@ The Interior Portal module combines 3D-printed parts with a custom PCB and a sma
 
 |   |
 | --- |
-| **3D-printing requirement:** Print `Internal-Portal-Final.3mf` from MakerWorld or Printables (see [`3D-Models/README.md`](../../../3D-Models/README.md)), in PETG. Supports are already part of the models. The cosmetic cap is Top-Screw-Cover — there is no separate Top-Cover for this device. |
+| **3D-printing requirement:** Print `Internal-Portal-Final.3mf` from [MakerWorld](https://makerworld.com/en/models/3347482-guardian-interior-portal-keypad-and-display) or [Printables](https://www.printables.com/model/1853748-guardian-interior-portal-esp32-s3-keypad-rfid-disp), in PETG. Supports are already part of the models. The cosmetic cap is Top-Screw-Cover — there is no separate Top-Cover for this device. |
 
 |   |
 | --- |

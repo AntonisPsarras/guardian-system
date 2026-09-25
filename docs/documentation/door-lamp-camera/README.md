@@ -18,7 +18,7 @@ Unlike the Doorbell and Interior Portal modules, this device contains no custom 
 
 |   |
 | --- |
-| **3D-printing requirement:** Print `Lamp-Final.3mf` from MakerWorld or Printables (see [`3D-Models/README.md`](../../../3D-Models/README.md)), in PETG. Supports are already part of the models. |
+| **3D-printing requirement:** Print `Lamp-Final.3mf` from [MakerWorld](https://makerworld.com/en/models/3347455-guardian-door-lamp-housing-tapo-c110-lantern) or [Printables](https://www.printables.com/model/1853736-guardian-door-lantern-tapo-c110-camera-l530e-hidde), in PETG. Supports are already part of the models. |
 
 |   |
 | --- |

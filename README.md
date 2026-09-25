@@ -75,18 +75,15 @@ only way to run it is a real Home Assistant instance and real hardware.
 
 ## Print files
 
-Meshes are not in this tree. Print the Bambu Studio profile for each
-device, in PETG. Intended storefront URLs are in
-[`docs/maintainers/print-listings.md`](docs/maintainers/print-listings.md);
-those MakerWorld and Printables listings are still draft or private
-until they are published. The Printables author page is
-[AntoniJuvenikal](https://www.printables.com/@AntoniJuveni_3576373).
+Meshes are not in this tree. Download the Bambu Studio profile for each
+device from the [MakerWorld collection](https://makerworld.com/en/collections/36079462-guardian-system)
+or the [Printables collection](https://www.printables.com/@AntoniJuveni_3576373/collections/3780824):
 
-| Device | Profile |
-|---|---|
-| Door lamp (Tapo C110 + L530E) | `Lamp-Final.3mf` |
-| Interior portal | `Internal-Portal-Final.3mf` |
-| Doorbell | `Doorbell-Final.3mf` |
+| Device | Profile | MakerWorld | Printables |
+|---|---|---|---|
+| Door lamp (Tapo C110 + L530E) | `Lamp-Final.3mf` | [listing](https://makerworld.com/en/models/3347455-guardian-door-lamp-housing-tapo-c110-lantern) | [listing](https://www.printables.com/model/1853736-guardian-door-lantern-tapo-c110-camera-l530e-hidde) |
+| Interior portal | `Internal-Portal-Final.3mf` | [listing](https://makerworld.com/en/models/3347482-guardian-interior-portal-keypad-and-display) | [listing](https://www.printables.com/model/1853748-guardian-interior-portal-esp32-s3-keypad-rfid-disp) |
+| Doorbell | `Doorbell-Final.3mf` | [listing](https://makerworld.com/en/models/3347498-guardian-outdoor-doorbell-housing-esp32-c6) | [listing](https://www.printables.com/model/1853742-guardian-outdoor-doorbell-housing-esp32-c6) |
 
 ## Documentation
 

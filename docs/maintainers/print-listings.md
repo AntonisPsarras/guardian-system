@@ -6,9 +6,7 @@ Each upload is the Bambu `.3mf` plus the matching assembly PDF.
 Firmware GPIO, Gerber zips, and the Home Assistant tree are **not** inside
 the `.3mf`. Name them as part of Guardian System.
 
-**Intended listing URLs** (still draft or private until you publish
-them — unauthenticated visits 404). Author page that *is* public:
-[AntoniJuvenikal on Printables](https://www.printables.com/@AntoniJuveni_3576373).
+**Live listings**
 
 | Device | MakerWorld | Printables |
 |---|---|---|
