@@ -12,8 +12,8 @@ working system.
 > caveats below before you run it. MIT, **as is, without warranty**.
 
 <p>
-<img src="docs/documentation/interior-portal/images/22.jpg" alt="Finished interior portal: speaker, display, and keypad in a white housing" width="32%">
-<img src="docs/documentation/doorbell/images/09.jpg" alt="Finished outdoor doorbell: white housing with a single button" width="32%">
+<img src="docs/documentation/interior-portal/images/readme.jpg" alt="Interior portal mounted on the wall: speaker, display, and keypad" width="32%">
+<img src="docs/documentation/doorbell/images/readme.jpg" alt="Outdoor doorbell mounted on the wall: white housing with a bell mark" width="32%">
 <img src="docs/documentation/door-lamp-camera/images/01.jpg" alt="Finished door lamp and camera housing mounted on a wall" width="32%">
 </p>
 
