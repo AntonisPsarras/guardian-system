@@ -5655,7 +5655,7 @@ guardian_slot_write:
 # alias, so keep the version the final word. It is never called and does
 # nothing; running it is harmless.
 guardian_version_marker:
-  alias: Guardian - Backend Version 2.32.5
+  alias: Guardian - Backend Version 2.33.0
   description: >-
     Version marker for scripts.yaml, read by sensor.guardian_version and shown
     on More -> Diagnostics. Does nothing when run. Bump the version in this

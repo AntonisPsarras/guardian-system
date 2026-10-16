@@ -5900,6 +5900,305 @@ Encryption stays off unless you follow INSTALL.md § Flash encryption over USB.
 332. **Check configuration** on the live Home Assistant after copy and
      restart. *Needs the Pi; not done.*
 
+## Forty-eighth pass — LUMA at dusk, a gentle door that was a tamper, and a key a hurried tap bricked
+
+Three live reports from the house, each traced to the line, plus an audit of
+the rest of the security state machine for the same classes. Lockstep
+**2.33.0**. Findings are F-59 to F-72 in `GUARDIAN_AUDIT.md` §8.8. Nothing here
+has run on hardware or on a live Home Assistant: the YAML was checked by
+preflight, by the self-test, and by rendering every new template against a
+stubbed Jinja environment; the firmware was **not compiled** (no ESPHome
+toolchain on the machine this was written on). Treat the verify steps below as
+the test, not as a formality.
+
+### 1. LUMA at dusk was an offline lamp, and a sampler a cloud bulb could kill
+
+**What the house saw.** "Ambient light sampling failed — the configured lamp
+is unknown or unavailable … `19:00 FAILED lamp_unavailable hold`", "sample did
+not finish … restored to `off`", and the **LUMA** badge, on darker evenings —
+while the porch lamp still came on when someone wanted it.
+
+- **An offline lamp was reported as a broken measurement (F-59).** A Tapo off
+  its cloud for a minute, or a bulb switched off at the wall, made
+  `guardian_sample_ambient_light` write `FAILED lamp_unavailable`, bump
+  `guardian_lamp_fail_streak` and recreate a persistent notification — every
+  ten minutes, because a lamp that is off samples on the fast cadence, which
+  is exactly dusk. `sensor.guardian_faults` raised LUMA on **any** `FAILED` in
+  the last result, so one transient was a red badge. The sampler's other
+  declines (`already_running`, `challenge`, `feedback`) also said FAILED. They
+  are all `HELD <why>` now (`lamp_offline`, `no_lamp`, `already_running`,
+  `challenge`, `feedback`, `alarm`): recorded, never counted, never notified.
+  LUMA, the failure notification and the phone push now share one rule:
+  **three failed samples in a row**.
+- **A cloud bulb raising mid-sample ended the run in the dark (F-60).** Every
+  `light.*` call in the sampler, `guardian_restore_lamp` and
+  `guardian_apply_lamp_sun_mismatch` was unguarded. At dusk the first
+  state-changing call of the evening is `light.turn_on` on a cloud bulb; a
+  `HomeAssistantError` ended the run with `guardian_lamp_sampling` on, and the
+  watchdog restored the pre-sample stash — `off`, by construction at dusk — a
+  minute later. All of them carry `continue_on_error` now (the `none` sentinel
+  already covered `vol.Invalid`). The watchdog **stops the sampler first**
+  (it used to restore underneath a run that was merely slow and then lose a
+  race with it), turns the lamp **on** when the sun is below −6° (the only
+  correct answer at night), restores the stash otherwise, and records
+  `FAILED interrupted on_sun|restored`, which counts toward the streak.
+- **The returning bulb waited for the next tick.** `Guardian: Camera-Based Lamp
+  Control` gains a `lamp_back` trigger: the configured lamp available again for
+  30 s samples immediately, bypassing the 30-minute gate.
+- **The restart half of F-39 had never run (F-61).** `guardian_lamp_presample`
+  declared `initial: none`, so the watchdog's start branch always read `none`.
+  The initial is gone. Preflight learned to see this through a variable (below).
+- **The probe never learned whether IR was configured (F-62).**
+  `shell_command.guardian_luma_write_run` passed three of the probe's four
+  arguments; `ir` is now `1` exactly when the sampler's own `ir_valid` holds.
+  No change on this house (Frigate, no IR entity).
+- Verbose and streak pushes inside the sampler are `script.turn_on`, so a phone
+  fan-out cannot hold the sampling flag toward the watchdog.
+
+The panel's Lamp page reads `HELD` as **Held** with the reason, paints a single
+failure amber rather than red, and its LUMA card now says what LUMA means.
+
+### 2. An ordinary open or close sounded the siren
+
+**What the house saw.** "Guardian: portal tamper — the door contact opened but
+the leaf never rotated", with the full alarm, on an open or close with no card
+scanned and Super Surveillance off. `Guardian: Portal Tamper Alert` is the only
+siren path for a plain open/close outside elevated mode, and it fired the major
+alarm for **every** `esphome.tamper_alert` (F-66).
+
+- **Spoofed contact was a gentle door (F-63).** The portal checked 600 ms after
+  the reed opened for `|swing_angle| < 1.5°`, but the swing integrator only
+  counts rotation above `swing_rate_threshold` (8 °/s). A door eased open, a
+  door pulled against its latch until the reed gap opened, a bumped reed: all
+  "the leaf never rotated". It now waits **8 s**, requires the reed still open,
+  no swing sample from 1.6 s before the edge onward and the leaf never past 3°,
+  and reports `evidence: weak`.
+- **Magnet defeat read the opening's leftovers (F-64).** The test ran 1.0 s
+  after a close against `swing_angle`, which keeps the whole opening until a
+  2 s reset — and a door pulled shut by a slow closer never integrates back. It
+  also integrated lever cross-talk with the door shut (INSTALL §9 step 15 even
+  said "move the leaf *or handle*"). It now runs on its own closed-door
+  integrator, zeroed at every close and throughout the 1 s slam window, reset
+  after 2 s of quiet, and held at zero while anybody is on the inside lever
+  (`handle_depressed`, a press in progress, or lever activity within
+  `handle_lookback`). The attack is an opening from outside, where there is no
+  lever. Reports `evidence: strong`.
+- **Magnet defeat was disarmed after every portal boot (F-65).**
+  `door_closed_ms` started at 0 and was set only on a close edge; it is now
+  seeded on the first physics tick with the door shut.
+- **Home Assistant alarms on strong evidence only.** `magnet_defeat` with
+  `evidence: strong` raises the major alarm exactly as before (first step,
+  non-maskable). Everything else — weak, or an old-firmware event with no
+  `evidence` field, whose magnet test had the residual bug — is a persistent
+  notification *possible portal tamper (not alarmed)* and an amber Activity
+  row. In elevated mode a weak report adds nothing anyway: the reed edge
+  already opened a challenge.
+
+Audited and **not** a source of this report: the Elevated Opening Supervisor,
+Entry Challenge Timeout, MFA Timeout and Door Left Open all require
+`binary_sensor.guardian_elevated_mode`; Unscanned Key Entry and Uncertain Door
+Direction push but never alarm; the offline siren needs a last-confirmed
+elevated mode. See §4 for the reason text that now says *why* elevated was on.
+
+### 3. The key that was refused after coming in
+
+**What the house saw.** Come in from outside (doorbell scan, door open), tap
+the same card on the interior portal before the door is shut, and from then on
+the card is refused; and the same, now and then, at random.
+
+- **A tear inside the MAC could only be healed by the reader that wrote it
+  (F-67).** A rotate rewrites the MAC a page at a time (NTAG 9→12, then the
+  counter) or a block at a time (Classic block 6, then 5). A card lifted
+  between two of those writes holds a *splice* of MAC(n) and MAC(n+1). The
+  forty-sixth pass healed only whole MACs at counter±1, plus a RAM stash on the
+  writing reader — gone after that reader rotates any other card, after a
+  reboot, and never present on the other reader. A doorbell tap lifted while
+  reaching for the key, then an interior tap: `bad_mac`, HOLD, forever, until
+  re-enrolled. `guardian_rfid` now recognises a page/block-boundary splice of
+  two adjacent MACs for this card (both write orders, both media) and rewrites
+  it consistently at the higher counter through the normal verified rotate.
+  Each half needs this card's key to produce, so a copy gains nothing it did
+  not already have; `window_ok` is unchanged.
+- **The interior tap during an entry was read as an exit (F-69).** Outside
+  elevated mode it opened a 20 s exit window against a door already open,
+  which could never complete. In elevated mode it started a fresh MFA after the
+  person had authenticated their way in — MFA on the screen instead of
+  GRANTED — which then ended in a major alarm either way: timeout, or the right
+  PIN typed with the door open (F-70, §4). `input_text.guardian_last_entry` now
+  records the slots of the last completed entry (Complete Authorized Passage,
+  and a cleared entry challenge). The same card at the interior reader within
+  three minutes, door open or shut within 15 s, nothing pending, is
+  **ENTRY_DONE**: GRANTED, welcome, and nothing started. Clone, stolen and HOLD
+  still win; they come first in the choose.
+- **Random denials that were the radio (F-68).** Every key enrolled since the
+  forty-third pass is password-protected, so every scan does a PWD_AUTH; one
+  garbled frame there left the read at NAK, skipped the retry and reported
+  `unsupported_tag` — UNSUPPORTED, latched until lift. A select that kept
+  failing and a spent retry budget were likewise `unsupported_tag` or
+  `bad_mac` about a good card. PWD_AUTH frame errors now retry like any link
+  error, and a link that gives up reports the new result **`read_fail`** (no
+  card_id, no verdict), which Home Assistant answers with a plain HOLD.
+- **The next miss is diagnosable without guessing.** `process_rfid_scan`
+  computes one `verdict` from the same ladder as its choose (the trace's own
+  ladder had drifted from it) and always writes
+  `input_text.guardian_last_scan`:
+  `21:04:13 portal slot 2 ENTRY_DONE r=ok c=41 s=40 rot=1 win=1` — reader,
+  slot, verdict, reported result and counter, the counter Home Assistant held
+  **before** the scan, rotate, window. No `initial:`; shown first on
+  More → Internals.
+
+Checked and **not** a cause: queued `process_rfid_scan` runs are serial and
+render their variables at run start, so two readers cannot both test the same
+stored counter; `counter_ok` can only fail if the helper write itself failed;
+both readers run one component and report `rotated` identically; the replay
+clause `rotated && reported <= stored` is unreachable by two readers in one
+passage, because a reader reports a rotate only after reading it back.
+
+### 4. Elevated alarms, the PIN at an open door, and presence
+
+- **A correct card-and-PIN at an already-open door was an alarm (F-70).** The
+  PIN handler raised "Door was already open when MFA was completed" whenever
+  the contact read open. Since F-49 every opening during an MFA becomes a
+  challenge, so the only remaining intrusion signature is a door that opened
+  *after* the MFA began. The handler now compares the contact's
+  `last_changed` with `portal_mfa_pending`'s, captured before it is cleared:
+  open before → authorise as usual; opened after → alarm, reason *Door opened
+  during MFA without a challenge*.
+- **No elevated alarm said why the house was elevated (F-72).**
+  `binary_sensor.guardian_elevated_mode` gains attribute `source` —
+  `manual switch` or `schedule <created and enabled program names>` — and the
+  supervisor's instant alarm, Entry Challenge Timeout, MFA Timeout, the PIN
+  lockout, the doorbell-exit timeout and Door Left Open append
+  `· SS: <source>`. Create Program arms 00:00–05:00 every day the moment it is
+  pressed; this is how a household finds the program it forgot.
+- **An elevated arrival stayed Away (F-71).** Doorbell scan (reconcile: Away),
+  open, PIN: nothing ever set the card At home, so `house_empty` and the
+  Frigate away-push misjudged a house with its owner inside.
+  `guardian_clear_entry_challenge` now sets a resident slot At home when the
+  opening's origin was not `inside`.
+
+### New helpers
+
+| Helper | Package | Notes |
+|---|---|---|
+| `input_text.guardian_last_entry` | `packages/guardian.yaml` | `<slots>\|<epoch>` of the last completed entry. Session state, `initial: none`. |
+| `input_text.guardian_last_scan` | `packages/guardian.yaml` | One line per card scan. **No `initial:`** — it must survive the restart done while chasing a refused key. |
+
+Changed: `input_text.guardian_lamp_presample` loses `initial: none`.
+`binary_sensor.guardian_elevated_mode` gains attribute `source`. New RFID
+result `read_fail`. New tamper payload fields `evidence` and
+`closed_swing_deg`. New lamp verdicts `HELD …` and `FAILED interrupted …`.
+
+### Removed
+
+Nothing.
+
+### Preflight
+
+`check_startup_reachable_state` now also follows a variable: in a
+`homeassistant: start` automation, `x: "{{ states('<helper with initial:>') … }}"`
+followed by `x not in [... '<initial>' ...]`, `x in [...]` without it,
+`x != '<initial>'` or `x == '<other>'` is a dead branch. That is the shape
+F-61 hid in. The self-test re-injects `initial: none` on the stash and must
+see the watchdog named.
+
+### Deploy class
+
+**FULL RESTART, then reflash the portal, then reflash the doorbell.** New
+helpers and a helper losing its `initial:` need the restart. The portal carries
+the tamper physics and the RFID component; the doorbell carries the RFID
+component (splice heal, `read_fail`). Copy `esphome/components/guardian_rfid/`
+before building either.
+
+The order is safe in between. With Home Assistant updated and the portal not
+yet flashed, the old firmware's tamper events carry no `evidence` and become
+notices, not sirens — which is the point, since that firmware's magnet test is
+the one that fired on ordinary closes. Until the portal is reflashed, **a real
+magnet defeat is a notice too.** Do not leave it there.
+
+**Copy `www/guardian-ui/guardian-panel.js`** — its version literal changed, and
+the Lamp, Activity and Internals views changed.
+
+### Verify
+
+333. **A lamp offline at dusk is not a fault.** Switch the porch bulb off at
+     the wall (or block it from Wi-Fi) before sunset. Over the next ten-minute
+     ticks `input_text.guardian_lamp_last_result` reads `HH:MM HELD
+     lamp_offline`, `guardian_lamp_fail_streak` does not move, no
+     *ambient light sampling failed* notification appears, and the panel shows
+     no LUMA. *Needs the house; not done.*
+334. **The bulb is set within a minute of returning.** Power it back on after
+     dark. Within ~35 s a sample runs (`lamp_back`) and the lamp is on.
+     *Not done.*
+335. **A sample killed at night leaves the lamp on.** After dark, start
+     Measure now and immediately take the bulb off Wi-Fi so its call hangs, or
+     stop `script.guardian_sample_ambient_light` by hand mid-run. Within ~60 s
+     the watchdog stops it, the lamp is **on**, and the last result reads
+     `FAILED interrupted on_sun`. In daylight the same test restores the
+     pre-sample state and reads `… restored`. *Not done.*
+336. **LUMA means three.** Point `input_text.guardian_camera_entity` at a camera
+     that does not exist. The first two samples write `FAILED
+     camera_unavailable` and raise nothing; the third raises LUMA, the
+     notification and one phone push. Put it back: one good reading clears all
+     three. *Not done.*
+337. **The restart branch of the lamp watchdog runs.** Restart Home Assistant
+     during a sample (Measure now, then restart within 5 s). On start the
+     watchdog restores (or, at night, lights) the lamp — it used to do
+     nothing. *Not done.*
+338. **A gentle open is not a tamper.** After the portal reflash, open the
+     door with a slow push, pull it against its latch until the reed reads
+     open, and let the closer shut it. No ALARM, no tamper notice. Repeat with
+     Super Surveillance on: only the usual challenge. *Needs the door.*
+339. **Gripping the handle of a shut door is not a tamper.** Press and hold
+     the inside lever with the door shut, push and pull it. Nothing.
+     *Needs the door.*
+340. **A real magnet defeat still alarms.** Hold the reed closed with a second
+     magnet and swing the leaf 15° or more without touching the lever. ALARM,
+     reason *Portal tamper: magnet defeat*, the push arrives (also with the
+     notify level Off). Then reboot the portal and repeat **without opening the
+     door first** — it must still alarm (F-65). *Needs the door.*
+341. **A reed open on a leaf that never moved is a notice.** Lift the magnet
+     off the shut door and leave it 10 s: one *possible portal tamper (not
+     alarmed)* notification, an amber Activity row, no siren. *Needs the door.*
+342. **The reported RFID sequence grants.** Outside elevated mode: tap at the
+     doorbell, open with the key, tap the same card on the interior portal with
+     the door still open. GRANTED, no exit window (`timer.guardian_exit_window`
+     idle), `input_text.guardian_last_scan` shows `ENTRY_DONE`. Close the door,
+     tap again a minute later: an ordinary GRANTED with an exit window.
+     *Needs the door and a card.*
+343. **The same in elevated mode does not alarm.** Doorbell tap, open, PIN at
+     the keypad, then tap the card inside with the door open: GRANTED, no MFA,
+     no alarm three minutes later, and the card reads At home. *Not done.*
+344. **A correct PIN at a door that was already open is not an alarm.** In
+     elevated mode, with the door open and no challenge running (e.g. step 343
+     after five minutes), tap a card inside to start MFA and enter the right
+     PIN: GRANTED. (The alarm remains only for a door that opened *after* the
+     MFA began without the supervisor challenging it, which cannot be produced
+     on purpose.) *Not done.*
+345. **A tap lifted mid-write heals on the other reader.** Flash both readers.
+     Tap a key at the doorbell and pull it away the instant HOLD CARD shows;
+     then tap it at the interior portal. GRANTED, and the portal log shows
+     `RFID torn-write recovery via splice` (or via counter±1). Repeat a few
+     times; it must never need re-enrolment. *Needs a real card; not done.*
+346. **Clone detection is unchanged.** Re-run step 316: a stale dump and a
+     verbatim replay of a rotated event still say COPY DETECTED.
+     *Not done.*
+347. **A bad radio day is HOLD, not UNSUPPORTED.** Tap a protected key at the
+     very edge of the field, or through a wet sleeve, until a scan fails. The
+     portal says HOLD CARD, not UNSUPPORTED or "not recognised", and
+     `guardian_last_scan` reads `READ_FAIL r=read_fail`. A proper tap then
+     grants. *Needs a real card; not done.*
+348. **The elevated alarm says why.** With a program enabled and the manual
+     switch off, let an entry challenge time out. The push and
+     `input_text.guardian_alarm_reason` end in `· SS: schedule <program
+     name>`. With the manual switch on: `· SS: manual switch`. *Not done.*
+349. **Preflight.** `python tools/guardian-preflight.py` reports all literals
+     at **2.33.0** and passes. `python tools/guardian-selftest-preflight.py`
+     ends **`37 of 37 faults caught.`**
+350. **Check configuration** on the live Home Assistant after copy and
+     restart, then flash the portal, then the doorbell. *Needs the Pi; not
+     done.*
+
 ## Still outstanding
 
 *Found in the forty-third pass and deliberately not fixed. Each says why, so the
@@ -5932,11 +6231,20 @@ next pass starts from a decision rather than a rediscovery.*
   should HOLD/retry three times, then re-enroll — and capture the ESPHome
   line `RFID scan (...): result=... card_id=... counter=... rotated=...`
   against the helper values. Do not widen `window_ok`.
+  *(Forty-eighth pass: a MAC torn mid-rewrite - a page or block splice of two
+  adjacent MACs - is now healed on either reader, not only by the writing
+  reader's RAM stash; `input_text.guardian_last_scan` now records every scan's
+  result, reported counter and stored counter, so the capture above is on
+  More → Internals without the ESPHome log. Step 345 is the test.)*
 - **Four garbled frames still produce a security verdict that sticks.**
   `transient_` absorbs three, then falls through to `bad_mac` or
   `unsupported_tag`, and the UID is latched so every retry is suppressed until
   the card is physically lifted. Reduced from one frame to four in an earlier
   pass; not eliminated. A wet or cold antenna reproduces it.
+  *(Forty-eighth pass: the fall-through is now `read_fail`, which carries no
+  verdict and is answered with HOLD; PWD_AUTH frame errors retry like the
+  rest. The UID is still latched until lift, deliberately - one report per
+  presentation. Unverified on hardware: step 347.)*
 - **`docs/reference-images/` is local-only.** Source photography of one
   install is not in the public tree. Assembly steps are in
   `docs/documentation/`.
@@ -5949,6 +6257,11 @@ next pass starts from a decision rather than a rediscovery.*
   (this list, first item) can still bias the gyro EMA; that is why the
   firmware waits on a sustained angle, not a spike, and why an unhealthy
   IMU skips spoofed-contact rather than alarming every real outside open.
+  *(Forty-eighth pass: only `magnet_defeat` with `evidence: strong` alarms;
+  spoofed contact waits 8 s and is a notice; magnet defeat uses its own
+  closed-door integrator, ignores the inside lever, and is armed from boot.
+  INSTALL §9 steps 15–17 and this file's steps 338–341 replace 328–329.
+  Hardware not claimed.)*
 - **`input_boolean.guest_bypass` is gone**, along with its automation and the
   panel mapping (forty-first pass). Nothing was ever built on it. On an existing
   install delete the helper by hand — removing it from the package does not

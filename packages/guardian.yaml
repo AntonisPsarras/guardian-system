@@ -1650,7 +1650,7 @@ template:
       - name: Guardian Version
         unique_id: guardian_version
         icon: mdi:tag-check-outline
-        state: '2.32.5'
+        state: '2.33.0'
         attributes:
           rfid_package: >-
             {% set v = states('sensor.guardian_rfid_version') %}

@@ -58,10 +58,10 @@
  * nothing makes them arrive together, so "the panel is new" says nothing about
  * scripts.yaml or packages/. When these disagree the panel says so instead of
  * letting old logic answer new questions. */
-const GUARDIAN_UI_VERSION = '2.32.5';
+const GUARDIAN_UI_VERSION = '2.33.0';
 
 /* What configuration.yaml ASKED the browser to load, read back off this module's
- * own URL (`/local/guardian-ui/guardian-panel.js?v=2.32.5`).
+ * own URL (`/local/guardian-ui/guardian-panel.js?v=2.33.0`).
  *
  * THIS IS THE THIRD NUMBER, AND WITHOUT IT DIAGNOSTICS GIVES THE WRONG REMEDY.
  * Until now the panel knew two things: the version compiled into the file it is
