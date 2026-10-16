@@ -157,6 +157,9 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   // (MAC matches counter-1 or counter+1) or retry a stashed write. Returns
   // true if it fired or deferred — caller must not then fire bad_mac.
   bool heal_torn_payload_(const uint8_t card_id[8], uint32_t counter, const uint8_t mac[16]);
+  // A tear INSIDE the MAC: a page/block-boundary splice of MAC(n) and MAC(n+1)
+  // for n in {counter-1, counter}. Sets *recovered to the higher counter.
+  bool splice_recover_(const uint8_t card_id[8], uint32_t counter, const uint8_t mac[16], uint32_t *recovered);
   static uint32_t next_counter_(uint32_t counter);
   // ST_OK, ST_NAK (every key rejected — a verdict), or ST_TIMEOUT (the card
   // could not be re-selected between attempts — a link error, retry it).
@@ -164,7 +167,12 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   bool classic_upgrade_trailer_();
   void maybe_upgrade_classic_();
   bool protect_ntag_();
-  bool authenticate_ntag_();
+  // *st receives the PWD_AUTH frame status, so a garbled frame can be retried
+  // as a link error instead of being scored as "this card is not ours".
+  bool authenticate_ntag_(Status *st);
+  // True for a frame-level failure (timeout, CRC, collision, transceive error)
+  // as opposed to a verdict the card actually gave (NAK, a wrong PACK).
+  static bool frame_error_(Status st);
   uint8_t cfg0_page_() const;
   bool enrollment_on_() const;
   // True when st is a frame-level failure AND the retry budget is not spent,
@@ -172,6 +180,9 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   // poll re-reads the same tag. Once the budget is spent it returns false and
   // the caller reports a verdict as before.
   bool transient_(const char *what, Status st);
+  // The retry budget is spent on a link error: fire "read_fail" (or, while
+  // enrolling, defer silently) instead of a verdict about the card.
+  void give_up_link_(const char *what, Status st);
   const char *status_name_(Status st) const;
   void fire_scan_(const char *result, bool rotated = false);
   // Write failed while the tag is still on the coil. Retry on the next poll
