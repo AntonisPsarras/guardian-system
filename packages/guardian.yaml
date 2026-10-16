@@ -1375,6 +1375,36 @@ template:
             {% endif %}
           {% endfor %}
           {{ manual or ns.on }}
+        # WHY elevated mode is on, for alarm reasons. An alarm that says
+        # "Elevated-mode opening ... not authenticated" was true and useless to a
+        # household that did not know elevated mode was on at all - Create
+        # Program arms 00:00-05:00 every day the moment it is pressed, and a
+        # leftover program is adopted as created. This names the switch, or the
+        # created AND enabled programs, so the push says which one to look at.
+        #
+        # Deliberately NOT the window arithmetic: that stays in the state
+        # template above as its only copy. When the manual switch is off and the
+        # state is on, one of the enabled programs matched by construction, and
+        # listing the enabled ones is enough to point at it. Built only from
+        # states() / is_state() on rack ids from sensor.guardian_ss_programs, so
+        # it cannot raise.
+        attributes:
+          source: >-
+            {% if is_state('input_boolean.super_surveillance_mode', 'on') %}manual switch
+            {%- else %}
+              {%- set rack = (states('sensor.guardian_ss_programs') | string).split(',')
+                             | map('trim') | reject('eq', '') | list -%}
+              {%- set ns = namespace(n=[]) -%}
+              {%- for raw in (states('sensor.guardian_ss_programs_created') | string).split(',') -%}
+                {%- set p = raw | trim -%}
+                {%- if p in rack and is_state('input_boolean.guardian_ss_' ~ p ~ '_enabled', 'on') -%}
+                  {%- set nm = states('input_text.guardian_ss_' ~ p ~ '_name') | string | trim -%}
+                  {%- set ns.n = ns.n + [nm if nm not in ['', 'none', 'unknown', 'unavailable']
+                                         else 'Program ' ~ p] -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{- ('schedule ' ~ (ns.n | join(', '))) if ns.n else 'schedule' -}}
+            {%- endif %}
 
       # Normalised doorbell reachability. The ESPHome "status" platform is the
       # canonical signal: Home Assistant keeps that one entity available when

@@ -7878,19 +7878,27 @@ const LIVE_EVENTS = [
       ? `${d.name || `Key ${d.slot}`}. No passage window was opened.`
       : 'No passage window was opened.',
   })],
-  ['esphome.tamper_alert', (d) => ({
-    tone: 'alarm', icon: 'mdi:shield-alert-outline', cat: 'security',
-    title: d && d.reason === 'magnet_defeat'
-      ? 'Portal tamper: magnet defeat'
-      : d && d.reason === 'spoofed_contact'
-        ? 'Portal tamper: spoofed contact'
-        : 'Portal tamper',
-    sub: d && d.reason === 'magnet_defeat'
-      ? 'The door leaf rotated while the contact still read closed.'
-      : d && d.reason === 'spoofed_contact'
-        ? 'The door contact opened but the leaf never rotated.'
-        : (d && d.reason ? String(d.reason) : ''),
-  })],
+  /* Same split as "Guardian: Portal Tamper Alert": only strong evidence
+   * alarmed, so only strong evidence is drawn as an alarm here. A weak report
+   * (or one from firmware too old to label it) is a notice. */
+  ['esphome.tamper_alert', (d) => {
+    const strong = !!(d && d.reason === 'magnet_defeat' && String(d.evidence || '') === 'strong');
+    return {
+      tone: strong ? 'alarm' : 'warn',
+      icon: strong ? 'mdi:shield-alert-outline' : 'mdi:shield-outline',
+      cat: 'security',
+      title: strong
+        ? 'Portal tamper: magnet defeat'
+        : d && d.reason === 'spoofed_contact'
+          ? 'Door contact open, leaf never moved'
+          : 'Possible portal tamper',
+      sub: strong
+        ? 'The door leaf rotated while the contact still read closed. The alarm was raised.'
+        : d && d.reason === 'spoofed_contact'
+          ? 'Not alarmed. Usually a door left ajar or a knocked magnet.'
+          : 'Not alarmed. Reflash the portal if this says magnet defeat.',
+    };
+  }],
   ['guardian.door_opened_from_inside', () => ({
     tone: 'pass', icon: 'mdi:arrow-right-bold-box-outline', cat: 'door',
     title: 'Door opened from inside', sub: '',

@@ -274,6 +274,15 @@ globals:
   # Both are gated on imu_healthy. A dead or latched gyro would otherwise
   # treat every real outside opening as a spoofed reed. Debounced so a slam
   # is not a tamper; cooldown so one event does not repeat.
+  #
+  # THEY ARE NOT EQUALLY STRONG, and the forty-eighth pass stopped pretending
+  # they were. Magnet defeat, measured on a closed-door integrator with the
+  # lever untouched, is physics the IMU can see: the leaf cannot turn fifteen
+  # degrees past a closed reed. Spoofed contact is "the reed says open and the
+  # integrator saw nothing", and the integrator only runs above the swing-rate
+  # threshold - a gentle open, a door pulled against its latch, or a bumped
+  # reed all look exactly like that. It now waits eight seconds and reports
+  # evidence "weak"; Home Assistant records it and does not sound the siren.
   - id: tamper_reason
     type: std::string
     initial_value: '""'
@@ -283,9 +292,27 @@ globals:
   - id: tamper_magnet_start_ms
     type: uint32_t
     initial_value: "0"
+  # Seeded at the first physics tick with the door shut (see the magnet-defeat
+  # block), not only on a close edge: at 0 the magnet-defeat test could not run
+  # at all, so every portal reboot disarmed it until the door had cycled once.
   - id: door_closed_ms
     type: uint32_t
     initial_value: "0"
+  # Leaf rotation integrated ONLY while the reed reads closed, past the slam
+  # window, with nobody on the inside lever. Its own integrator on purpose:
+  # swing_angle carries the whole opening's residual until the 2 s reset after
+  # a close, and a door pulled shut by a slow closer (below the swing-rate
+  # threshold, so never integrated back) left 60-90 degrees in it - read 1 s
+  # after the close as "the leaf is rotating with the reed closed".
+  - id: tamper_closed_swing
+    type: float
+    initial_value: "0.0"
+  # "strong" or "weak", sent with every esphome.tamper_alert. Home Assistant
+  # raises the siren only for strong evidence; an event without the field is
+  # from firmware older than the forty-eighth pass and is treated as weak.
+  - id: tamper_evidence
+    type: std::string
+    initial_value: '"weak"'
   # How many API clients are currently connected. The native API allows more
   # than one (Home Assistant, plus the ESPHome dashboard/log viewer whenever
   # someone opens it) and on_client_connected/on_client_disconnected fire
@@ -1120,7 +1147,9 @@ binary_sensor:
               return ok ? "true" : "false";
       # Spoofed contact: the reed opened but the leaf never rotated. Do not
       # fire on the open edge - a slow outside open and a bumped reed both
-      # look like that for a moment. Wait, then re-check swing.
+      # look like that for a moment. Wait, then re-check swing. The wait was
+      # 600 ms and that was the household's "tamper with nobody touching
+      # anything": see check_spoofed_reed.
       - script.execute: check_spoofed_reed
     on_release:
       - lambda: |-
@@ -1128,6 +1157,9 @@ binary_sensor:
           id(ui_last_activity_ms) = now;
           id(door_closed_ms) = now;
           id(tamper_magnet_start_ms) = 0;
+          // A fresh closed-door integrator for every close: whatever the
+          // opening left behind is not rotation past a closed reed.
+          id(tamper_closed_swing) = 0.0f;
           id(last_dwell_ms) = id(door_open_ms) == 0
                                 ? 0
                                 : (uint32_t)(now - id(door_open_ms));
@@ -1192,6 +1224,10 @@ script:
           event: esphome.tamper_alert
           data:
             reason: !lambda "return id(tamper_reason);"
+            # Home Assistant sounds the siren only for "strong". See the
+            # tamper comment in globals.
+            evidence: !lambda "return id(tamper_evidence);"
+            closed_swing_deg: !lambda "return str_sprintf(\"%.1f\", id(tamper_closed_swing));"
             swing_angle_deg: !lambda "return str_sprintf(\"%.1f\", id(swing_angle));"
             swing_peak_dps: !lambda "return str_sprintf(\"%.1f\", id(swing_peak_dps));"
             swing_confirmed: !lambda "return id(ev_swing_confirmed) ? \"true\" : \"false\";"
@@ -1202,28 +1238,46 @@ script:
               return ok ? "true" : "false";
       - lambda: |-
           ESP_LOGW("guardian",
-                   "TAMPER: %s swing=%.1f peak_dps=%.1f door_open=%s",
-                   id(tamper_reason).c_str(), id(swing_angle), id(swing_peak_dps),
+                   "TAMPER: %s evidence=%s closed_swing=%.1f swing=%.1f peak_dps=%.1f door_open=%s",
+                   id(tamper_reason).c_str(), id(tamper_evidence).c_str(),
+                   id(tamper_closed_swing), id(swing_angle), id(swing_peak_dps),
                    id(door_contact).state ? "true" : "false");
+  # WAS 600 ms, AND THAT WAS THE FALSE ALARM. The swing integrator only counts
+  # rotation above swing_rate_threshold (8 deg/s by default), so for the first
+  # 600 ms after the reed opens a gentle push, a door eased open, a door pulled
+  # against its latch until the reed gap opened, or a bumped reed all read as
+  # "the leaf never rotated" - and Home Assistant answered every one with the
+  # full siren. The household saw "Portal tamper: the door contact opened but
+  # the leaf never rotated" with nobody touching anything unusual.
+  #
+  # Eight seconds is longer than any real passage takes to start swinging, and
+  # the test is now "no swing sample at all from 1.6 s before the reed edge
+  # onward, and the leaf never reached 3 degrees" rather than an instantaneous
+  # angle. What is left - a reed that has read open for eight seconds on a leaf
+  # that has not moved - is a cut wire, a removed magnet, or a door left ajar.
+  # Those deserve a notice, not a siren, so this always reports "weak".
   - id: check_spoofed_reed
     mode: restart
     then:
-      - delay: 600ms
+      - delay: 8s
       - lambda: |-
           const uint32_t now = millis();
-          // Reed bounced closed again - not a spoof, a bump.
+          // Reed closed again - not a spoof, a bump or a short opening.
           if (!id(door_contact).state) return;
           const bool imu_ok = id(imu_ready) &&
                               (uint32_t)(now - id(imu_last_ms)) < 500;
-          // A dead gyro would alarm every real outside open. Skip.
+          // A dead gyro would report every real outside open. Skip.
           if (!imu_ok) return;
-          const bool swung = fabsf(id(swing_angle)) >= 1.5f ||
+          // Signed, rollover-safe: any swing sample from 1.6 s before the
+          // reed edge onward means the leaf moved.
+          const bool swung = id(open_max_angle) >= 3.0f ||
                              (id(last_swing_ms) != 0 &&
-                              (uint32_t)(now - id(last_swing_ms)) <= 1600);
+                              (int32_t)(id(last_swing_ms) - id(door_open_ms)) >= -1600);
           if (swung) return;
           if (id(tamper_last_ms) != 0 &&
               (uint32_t)(now - id(tamper_last_ms)) < 15000) return;
           id(tamper_reason) = "spoofed_contact";
+          id(tamper_evidence) = "weak";
           id(tamper_last_ms) = now;
           id(fire_tamper).execute();
 
@@ -1471,8 +1525,25 @@ interval:
           // threshold: the IMU is on the lever and moves on every normal open.
           // Skip the close-slam window, require a wind-tolerant angle for a
           // few hundred milliseconds, and do not fire if the gyro is unhealthy.
+          //
+          // Forty-eighth pass: this read swing_angle, which still held the
+          // whole opening until the 2 s reset after a close. A door pulled
+          // shut by a slow closer never integrates back (below the swing-rate
+          // threshold), so 1.0-1.35 s after an ordinary close the test saw
+          // tens of degrees "with the reed closed" and the siren sounded. It
+          // now integrates its own angle, from zero, only once the door has
+          // been shut past the slam window, and only while nobody is on the
+          // inside lever: the attack is an opening from OUTSIDE, where there
+          // is no lever, and a hand gripping the inside lever of a shut door
+          // tilts the gravity estimate enough to leak into the swing axis.
           const bool imu_ok = id(imu_ready) &&
                               (uint32_t)(now - id(imu_last_ms)) < 500;
+          // Seed the closed timestamp on the first tick after boot with the
+          // door shut. At 0 the test below could never run, so a power cut
+          // disarmed magnet defeat until somebody next opened the door.
+          if (!door_open && id(door_closed_ms) == 0) {
+            id(door_closed_ms) = now == 0 ? 1 : now;
+          }
           const uint32_t closed_for = (!door_open && id(door_closed_ms) != 0)
                                         ? (uint32_t)(now - id(door_closed_ms))
                                         : 0;
@@ -1480,14 +1551,33 @@ interval:
           constexpr uint32_t TAMPER_HOLD_MS = 350;
           constexpr uint32_t TAMPER_CLOSED_MS = 1000;
           constexpr uint32_t TAMPER_COOLDOWN_MS = 15000;
-          if (!door_open && imu_ok && closed_for >= TAMPER_CLOSED_MS &&
-              fabsf(id(swing_angle)) >= TAMPER_SWING_DEG) {
+          constexpr uint32_t TAMPER_QUIET_RESET_MS = 2000;
+          const uint32_t lookback_ms = (uint32_t) id(handle_lookback).state;
+          const bool lever_busy = id(handle_depressed).state ||
+                                  id(lever_press_start_ms) != 0 ||
+                                  (id(lever_last_active_ms) != 0 &&
+                                   (uint32_t)(now - id(lever_last_active_ms)) <= lookback_ms);
+          if (door_open || closed_for < TAMPER_CLOSED_MS || lever_busy) {
+            // Open, still settling from the slam, or a hand on the lever:
+            // nothing here is rotation past a closed reed.
+            id(tamper_closed_swing) = 0.0f;
+          } else if (fabsf(id(swing_dps)) >= swing_thr) {
+            id(tamper_closed_swing) += id(swing_dps) * dt;
+          } else if (id(last_swing_ms) == 0 ||
+                     (uint32_t)(now - id(last_swing_ms)) > TAMPER_QUIET_RESET_MS) {
+            // Quiet for two seconds: whatever accumulated was noise, not a
+            // leaf on its way open. A real defeat is one continuous swing.
+            id(tamper_closed_swing) = 0.0f;
+          }
+          if (!door_open && imu_ok && closed_for >= TAMPER_CLOSED_MS && !lever_busy &&
+              fabsf(id(tamper_closed_swing)) >= TAMPER_SWING_DEG) {
             if (id(tamper_magnet_start_ms) == 0) {
               id(tamper_magnet_start_ms) = now;
             } else if ((uint32_t)(now - id(tamper_magnet_start_ms)) >= TAMPER_HOLD_MS &&
                        (id(tamper_last_ms) == 0 ||
                         (uint32_t)(now - id(tamper_last_ms)) >= TAMPER_COOLDOWN_MS)) {
               id(tamper_reason) = "magnet_defeat";
+              id(tamper_evidence) = "strong";
               id(tamper_last_ms) = now;
               id(tamper_magnet_start_ms) = 0;
               id(fire_tamper).execute();

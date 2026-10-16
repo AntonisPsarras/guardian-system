@@ -1021,19 +1021,25 @@ again after any change to the alarm path.
     portal, the RFID reader and the door logic are all local and must be
     unaffected. **Push notifications will not arrive** — that is expected and is
     the subject of §10. Everything else working is the point of the test.
-15. **Magnet defeat is a tamper.** After the **portal** reflash, hold the reed
-    closed (a second magnet, or cheat the contact) and move the leaf or handle
-    so the swing integrator runs. Expected: portal ALARM, looping siren,
-    non-maskable push, reason *Portal tamper: magnet defeat*. A slam-shut must
-    **not** do this.
-16. **A spoofed contact is a tamper.** Open the reed without rotating the leaf
-    (lift the magnet, door still shut). After about 600 ms: ALARM, reason
-    *Portal tamper: spoofed contact*. If the IMU is unhealthy this path is
-    skipped on purpose.
+15. **Magnet defeat is a tamper.** After the **portal** reflash, wait a few
+    seconds with the door shut, then hold the reed closed (a second magnet, or
+    cheat the contact) and swing the **leaf** at least 15° without touching
+    the inside lever. Expected: portal ALARM, looping siren, non-maskable push,
+    reason *Portal tamper: magnet defeat*. Gripping or pressing the inside
+    lever with the door shut must **not** do this, and nor must a slam-shut or
+    a door pulled closed by its closer. (2.33 and later: the lever is the
+    inside of the door, and a magnet defeat is an attack from outside.)
+16. **A spoofed contact is a notice, not a siren.** Lift the magnet so the reed
+    reads open with the door still shut, and leave it. After about 8 seconds:
+    a persistent notification *Guardian: possible portal tamper (not
+    alarmed)* and an amber row in Activity — **no** ALARM. An unhealthy IMU
+    skips this on purpose. (Before 2.33 this sounded the siren after 600 ms,
+    which is what a gently opened door also looked like.)
 17. **A normal open is not a tamper.** Open from inside and from outside the
-    usual way. Neither must raise tamper. Then mute the other person's key to
-    Off (if you added a second account) and fire step 10 again: the house
-    alarm must still reach the linked phone.
+    usual way, briskly and with a gentle push, and let the door close on its
+    own. None of these may raise tamper or a notice. Then mute the other person's
+    key to Off (if you added a second account) and fire step 10 again: the
+    house alarm must still reach the linked phone.
 
 If step 1 keeps listing something you believe you have done, trust the wizard
 over the appearance of the panel. It asks the backend; the panel renders the

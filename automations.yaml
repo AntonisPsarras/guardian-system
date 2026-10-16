@@ -140,31 +140,66 @@
     guardian.major_alarm first, so the Major Alarm Handler owns the siren,
     the ALARM screen, and the non-maskable broadcast. A log write or a
     badge must never stand in front of that.
+
+    Since the forty-eighth pass it escalates only what the physics can prove.
+    It used to fire the full alarm for every tamper event, and the portal's
+    spoofed-contact test fired on a gently opened door - so with Super
+    Surveillance off and no card scanned, an ordinary open or close sounded
+    the siren. The portal now labels each event with its evidence: a magnet
+    defeat measured on its closed-door integrator with the lever untouched is
+    "strong" and alarms exactly as before; a reed that reads open on a leaf
+    that never moved is "weak" and is recorded and shown, never sounded. An
+    event with no evidence field comes from firmware older than that pass,
+    whose magnet test also fired on ordinary closes, so it is treated as
+    weak until the portal is reflashed.
   triggers:
   - trigger: event
     event_type: esphome.tamper_alert
   actions:
-  - event: guardian.major_alarm
-    event_data:
-      reason: >-
-        {% set r = trigger.event.data.reason | default('', true) | string | trim %}
-        {% if r == 'magnet_defeat' %}Portal tamper: magnet defeat
-        {% elif r == 'spoofed_contact' %}Portal tamper: spoofed contact
-        {% else %}Portal tamper: {{ r if r else 'unknown' }}{% endif %}
-  - action: persistent_notification.create
-    continue_on_error: true
-    data:
-      title: 'Guardian: portal tamper'
-      notification_id: guardian_portal_tamper
-      message: >-
-        {% set r = trigger.event.data.reason | default('', true) | string | trim %}
-        {% if r == 'magnet_defeat' %}
-          The door leaf rotated while the contact still read closed.
-        {% elif r == 'spoofed_contact' %}
-          The door contact opened but the leaf never rotated.
-        {% else %}
-          Portal tamper ({{ r if r else 'unknown' }}).
-        {% endif %}
+  # Defaulted reads of the event payload only - nothing here can raise in
+  # front of the alarm below.
+  - variables:
+      reason_raw: "{{ trigger.event.data.reason | default('', true) | string | trim }}"
+      evidence: "{{ trigger.event.data.evidence | default('', true) | string | trim | lower }}"
+  - choose:
+    - conditions:
+      - condition: template
+        value_template: "{{ reason_raw == 'magnet_defeat' and evidence == 'strong' }}"
+      sequence:
+      - event: guardian.major_alarm
+        event_data:
+          reason: 'Portal tamper: magnet defeat'
+      - action: persistent_notification.create
+        continue_on_error: true
+        data:
+          title: 'Guardian: portal tamper'
+          notification_id: guardian_portal_tamper
+          message: >-
+            The door leaf rotated
+            {{ trigger.event.data.closed_swing_deg | default('?', true) }}° while
+            the contact still read closed and nobody was on the inside lever.
+            That is a defeated door contact; the alarm was raised.
+    default:
+    - action: persistent_notification.create
+      continue_on_error: true
+      data:
+        title: 'Guardian: possible portal tamper (not alarmed)'
+        notification_id: guardian_portal_tamper
+        message: >-
+          {% if reason_raw == 'spoofed_contact' %}
+            The door contact has read open for several seconds while the leaf
+            never moved. Usually a door left ajar, a magnet knocked off, or a
+            cut contact wire - check the reed and its magnet.
+          {% elif reason_raw == 'magnet_defeat' %}
+            The portal reported a magnet defeat without its evidence label.
+            That is firmware older than Guardian 2.33, whose test also fired
+            on ordinary closes; reflash the interior portal to arm tamper.
+          {% else %}
+            Portal tamper report ({{ reason_raw if reason_raw else 'unknown' }}).
+          {% endif %}
+          No alarm was raised: this is not evidence the IMU can confirm.
+          {{ 'Super Surveillance is on, so any opening is already being challenged.'
+             if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
   mode: queued
   max: 5
 - id: '1774280492831'
@@ -1121,7 +1156,11 @@
           value: inside
       - event: guardian.major_alarm
         event_data:
-          reason: Elevated-mode inside opening with house believed empty
+          reason: >-
+            Elevated-mode inside opening with house believed empty
+            {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+                | default('', true) | string))
+                if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
     default:
     # How long this particular challenge gets. An inside opening with the cards
     # reading empty and nothing corroborating it is the case that used to fire
@@ -1515,6 +1554,22 @@
       - condition: template
         value_template: '{{ pin_check.matches | bool }}'
       sequence:
+      # Captured BEFORE portal_mfa_pending is switched off below, because its
+      # last_changed is the evidence: when the MFA began. "The door was already
+      # open when the card was scanned" is a person who tapped their card with
+      # the door standing open - finishing an entry, or leaving through a door
+      # someone else is holding - and has now presented card AND PIN. "The door
+      # opened after the MFA began" is the intrusion signature the alarm below
+      # exists for; since F-49 the supervisor turns any such opening into an
+      # entry challenge, so it only reaches here when the supervisor never ran.
+      # Both reads are behind is_state() short-circuits, so a missing entity is
+      # false rather than a TemplateError.
+      - variables:
+          door_open_before_mfa: >-
+            {{ is_state('binary_sensor.guardian_interior_portal_door_contact', 'on')
+               and is_state('input_boolean.portal_mfa_pending', 'on')
+               and as_timestamp(states.binary_sensor.guardian_interior_portal_door_contact.last_changed, 0)
+                   <= as_timestamp(states.input_boolean.portal_mfa_pending.last_changed, 0) }}
       - action: timer.cancel
         target:
           entity_id: timer.guardian_mfa_window
@@ -1532,9 +1587,9 @@
             value_template: "{{ (slot | string | trim) in ((states('sensor.guardian_rfid_slots')
               | string).split(',') | map('trim') | reject('eq', '') | list) and source in
               ['doorbell', 'interior_portal'] }}"
-          - condition: state
-            entity_id: binary_sensor.guardian_interior_portal_door_contact
-            state: 'off'
+          - condition: template
+            value_template: "{{ is_state('binary_sensor.guardian_interior_portal_door_contact', 'off')
+              or door_open_before_mfa | bool }}"
           sequence:
           - action: script.guardian_authorize_passage
             data:
@@ -1560,9 +1615,18 @@
           # happened outside elevated mode or while a passage window was running
           # and something else has since gone wrong. The branch above handles the
           # supervised case, which is the one this used to block.
+          #
+          # And, since the forty-eighth pass, only the door that opened AFTER the
+          # card was scanned. A card tapped at an already-open door, then the
+          # right PIN, used to land here too: the household's "tap inside before
+          # the door is shut" ended in a siren for someone holding both factors.
           - event: guardian.major_alarm
             event_data:
-              reason: Door was already open when MFA was completed
+              reason: >-
+                Door opened during MFA without a challenge
+                {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+                    | default('', true) | string))
+                    if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
         default:
         - action: script.guardian_set_display
           data:
@@ -1636,7 +1700,11 @@
             notification_id: guardian_doorbell_exit_pin
         - event: guardian.major_alarm
           event_data:
-            reason: Maximum PIN attempts exceeded
+            reason: >-
+              Maximum PIN attempts exceeded
+              {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+                  | default('', true) | string))
+                  if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
       default:
       - action: script.guardian_set_display
         data:
@@ -1982,7 +2050,11 @@
       value: 0
   - event: guardian.major_alarm
     event_data:
-      reason: MFA authentication timed out
+      reason: >-
+        MFA authentication timed out
+        {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+            | default('', true) | string))
+            if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
   mode: single
 - id: '1786500000010'
   alias: 'Guardian: Entry Challenge Timeout'
@@ -2019,6 +2091,9 @@
         }} not authenticated within
         {{ states('input_number.guardian_challenge_seconds_applied')
         | int(states('input_number.guardian_entry_challenge_seconds') | int(30)) }}s
+        {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+            | default('', true) | string))
+            if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
   - delay: 00:00:01
   - action: input_boolean.turn_off
     target:
@@ -2055,6 +2130,9 @@
         {{ states('input_text.guardian_doorbell_exit_slot') }} not confirmed
         with the master PIN within
         {{ states('input_number.guardian_doorbell_exit_pin_minutes') | int(10) }}m
+        {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+            | default('', true) | string))
+            if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
   - delay: 00:00:01
   - action: input_boolean.turn_off
     target:
@@ -4236,7 +4314,11 @@
       sequence:
       - event: guardian.major_alarm
         event_data:
-          reason: Front door left open for five minutes in elevated mode
+          reason: >-
+            Front door left open for five minutes in elevated mode
+            {{- (' · SS: ' ~ (state_attr('binary_sensor.guardian_elevated_mode', 'source')
+                | default('', true) | string))
+                if is_state('binary_sensor.guardian_elevated_mode', 'on') else '' }}
   # single is safe and no latch helper is needed, which is worth stating because
   # every other repeating alert in this file has one. A "for" state trigger fires
   # once per continuous period in the state, so neither of these can repeat
