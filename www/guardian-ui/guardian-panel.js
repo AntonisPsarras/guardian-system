@@ -2631,7 +2631,7 @@ function buildSecurity(hass, m) {
 const FAULT_COPY = {
   DOORBELL: ['Doorbell offline', 'The exterior reader and the doorbell button are not responding.'],
   CAMERA: ['Camera unavailable', 'The door camera is not reporting, so the lamp cannot be measured.'],
-  LUMA: ['Light measurement failed', 'The last ambient sample produced no usable reading.'],
+  LUMA: ['Light measurement is broken', 'Three ambient samples in a row produced no usable reading, so the lamp is running on sun elevation alone. One miss is routine and is not reported here.'],
   IMU: ['Portal IMU fault', 'The door motion sensor is unhealthy, so inside/outside direction is less reliable.'],
 };
 
@@ -2752,7 +2752,11 @@ function buildHealth(hass, camId) {
   const doorbellUp = isOn(hass, E.doorbellOnline);
   const camOk = camId && !isBlank(camId) && !dead(hass, camId);
   const imuProblem = st(hass, E.portalImuProblem) === 'on';
-  const lumaFailed = String(st(hass, E.lampResult, '')).includes('FAILED');
+  /* Mirrors the LUMA clause of sensor.guardian_faults rather than re-deriving
+   * one: three failed samples in a row. It used to be "the last verdict says
+   * FAILED", which made a single miss - or a lamp that was merely offline - a
+   * health fault. */
+  const lumaFailed = num(hass, E.lampFailStreak, 0) >= 3;
 
   return {
     portal: {
@@ -2800,10 +2804,24 @@ const LAMP_DECISION = {
 
 const LAMP_FAIL_WHY = {
   camera_unavailable: 'the camera entity was missing or unavailable',
+  interrupted: 'the sample did not finish within a minute and was stopped',
+  // Pre-2.33 verdict strings, still in history.
   lamp_unavailable: 'the lamp entity was missing or unavailable',
   already_running: 'a sample was already running, or the sampling flag was stuck on',
   alarm: 'the display is ALARM, so the sampler refused to take the lamp',
   feedback: 'a lamp feedback flash was in progress',
+};
+
+/* A HELD verdict is the sampler declining to measure, which is not a failure
+ * and must not look like one. The backend writes HELD for these since 2.33;
+ * "HELD alarm" predates that and used to parse as "Unparsed". */
+const LAMP_HELD_WHY = {
+  alarm: 'the alarm owns the lamp, so nothing was measured',
+  challenge: 'an authentication challenge holds the lamp amber',
+  feedback: 'a card feedback flash was in progress',
+  already_running: 'a sample was already running',
+  lamp_offline: 'the lamp is offline or unreachable, so there was nothing to switch — it is sampled again within a minute of coming back',
+  no_lamp: 'no lamp is configured',
 };
 
 function parseLampResult(raw) {
@@ -2814,8 +2832,17 @@ function parseLampResult(raw) {
   const sun = (s.match(/sun=(-?[\d.]+)/) || [])[1];
   const failed = /\bFAILED\b/.test(s);
   const failReason = (s.match(/\bFAILED\s+(\w+)/) || [])[1] || '';
+  const heldReason = (s.match(/\bHELD\s+(\w+)/) || [])[1] || '';
   const decision = (s.match(/\b(on_camera|off_camera|on_sun_override|off_sun_override|off_day_hold|on_sun|off_sun|hold|on_mismatch|off_mismatch)\b/) || [])[1] || '';
   const mode = (s.match(/\b(manual|learn|auto)\s*$/) || [])[1] || '';
+  if (heldReason && !failed) {
+    return {
+      at, luma, sun, failed: false, held: true, failReason: '', decision: '', mode,
+      verdict: 'Held',
+      why: LAMP_HELD_WHY[heldReason] || `the sampler held (${heldReason})`,
+      raw: s,
+    };
+  }
   const d = LAMP_DECISION[decision] || ['Unparsed', s];
   const verdict = failed ? 'Measurement failed' : d[0];
   const failWhy = LAMP_FAIL_WHY[failReason];
@@ -6549,7 +6576,11 @@ function viewLamp(m, hass, ui = {}) {
   const L = m.lamp;
   const out = [pageHead('Lamp')];
   const r = L.result;
-  const verdictTone = r ? (r.failed ? 'alarm' : r.decision.startsWith('on') ? 'warn' : 'idle') : 'idle';
+  /* One failed sample is routine; three in a row is the LUMA fault. The tone
+   * says which, instead of painting every miss in alarm red. */
+  const verdictTone = r
+    ? (r.failed ? (L.failStreak >= 3 ? 'alarm' : 'warn') : r.decision.startsWith('on') ? 'warn' : 'idle')
+    : 'idle';
 
   if (L.missing) {
     out.push(noteHtml('This panel has no lamp entity to talk to. Set <b>config.lamp</b> in the Guardian panel_custom block to your light. Lamp automation in the YAML still uses this house’s original entity until a later pass.',
@@ -7802,7 +7833,7 @@ function interpretHistory(hass, hist, m) {
     if (i === 0 || p.state === arr[i - 1].state || bad(p.state) || p.state === 'none') return;
     const r = parseLampResult(p.state);
     if (!r) return;
-    push(p.ts, r.failed ? 'alarm' : r.decision.startsWith('on') ? 'warn' : 'idle',
+    push(p.ts, r.failed ? 'warn' : r.decision.startsWith('on') ? 'warn' : 'idle',
       r.failed ? 'mdi:lightbulb-alert-outline' : 'mdi:lightbulb-outline',
       'lamp', r.verdict, `${r.why}${r.luma ? ` · luma ${r.luma}` : ''}${r.sun ? ` · sun ${r.sun}°` : ''}`);
   });

@@ -2854,6 +2854,20 @@
   - trigger: homeassistant
     event: start
     id: startup
+  # The bulb came back. While it is offline the sampler can only record
+  # "HELD lamp_offline" - there is nothing to switch, so the sun fallback the
+  # camera-missing path applies has nowhere to go. Without this the first real
+  # decision after a Tapo cloud blip (or the wall switch going back on) waited
+  # for the next ten-minute tick, at night a dark porch for up to ten minutes.
+  # Thirty seconds of debounce so a bulb flapping on its Wi-Fi is not blacked
+  # out for a measurement on every flap. Same guarded double-states() form as
+  # "Guardian: Lamp Sun-Mismatch Fallback": the outer read is checked for the
+  # `none` sentinel before it is used as an entity id.
+  - trigger: template
+    value_template: "{{ states('sensor.guardian_lamp_entity') not in ['none', 'unknown', 'unavailable', '']
+      and states(states('sensor.guardian_lamp_entity')) not in ['unknown', 'unavailable'] }}"
+    for: 00:00:30
+    id: lamp_back
   conditions:
   # Sampling blacks the bulb out for a few seconds to read true ambient light.
   # That is invisible while the lamp is already off, so poll fast then and catch
@@ -2865,7 +2879,7 @@
   # first sample after a restart always runs.
   - condition: template
     value_template: >-
-      {{ trigger.id == 'startup' or
+      {{ trigger.id in ['startup', 'lamp_back'] or
          states('sensor.guardian_lamp_entity') in ['none', 'unknown', 'unavailable', ''] or
          not is_state(states('sensor.guardian_lamp_entity'), 'on') or
          (as_timestamp(now()) -
@@ -2912,39 +2926,104 @@
     entity_id: input_boolean.guardian_lamp_sampling
     state: 'on'
   actions:
+  # Stop the run first. The flag being on for 60s does not mean the sampler is
+  # dead - a slow cloud bulb or snapshot can still be inside it - and restoring
+  # underneath a live run let the two fight: the sampler switched the lamp on,
+  # then this put back the pre-sample "off" a moment later. Stopped, the run
+  # cannot touch the lamp again and this automation's decision is the last one.
+  # Guarded: a script that already finished, or is not loaded yet at startup,
+  # must not keep the lamp dark.
+  - action: script.turn_off
+    continue_on_error: true
+    target:
+      entity_id: script.guardian_sample_ambient_light
   - action: input_boolean.turn_off
     target:
       entity_id: input_boolean.guardian_lamp_sampling
   - variables:
       stash: "{{ states('input_text.guardian_lamp_presample') | string | trim }}"
+      # The same night the sampler and the sun-mismatch fallback use. At night
+      # a sample has exactly one acceptable outcome - the lamp on - so that is
+      # what an interrupted one gets, whatever the stash says. The stash is
+      # "off" at dusk by construction (the lamp was off when the sample began,
+      # which is WHY it was sampling every ten minutes), so restoring it was
+      # the reported "lamp restored to off" in the dark.
+      night: "{{ states('sun.sun') not in ['unknown', 'unavailable']
+        and (state_attr('sun.sun', 'elevation') | float(0)) < -6 }}"
+      lamp: >-
+        {% set e = states('sensor.guardian_lamp_entity') | string | trim %}
+        {{ e if e is match('^(?!.+__)(?!_)[\da-z_]+(?<!_)\.(?!_)[\da-z_]+(?<!_)$') else 'none' }}
   - if:
     - condition: template
       value_template: "{{ stash not in ['', 'none', 'unknown', 'unavailable'] }}"
     then:
-    - action: script.guardian_restore_lamp
-      data:
-        # "off" or "on|<brightness>|<kelvin>". prev_rgb is deliberately omitted:
-        # guardian_restore_lamp prefers rgb when it is present, and the stash
-        # cannot carry a tuple through an input_text without quoting games.
-        was_on: "{{ stash.split('|')[0] == 'on' }}"
-        prev_brightness: "{{ (stash.split('|')[1] | int(255))
-          if '|' in stash else 255 }}"
-        prev_kelvin: "{{ (stash.split('|')[2] | int(0)) if stash.split('|') | count
-          > 2 else 0 }}"
+    - choose:
+      - conditions:
+        - condition: template
+          value_template: '{{ night | bool }}'
+        sequence:
+        - action: light.turn_on
+          continue_on_error: true
+          target:
+            entity_id: '{{ lamp }}'
+          data:
+            # Same values as the sampler's on_sun branch.
+            color_temp_kelvin: 6500
+            brightness_pct: 45
+            transition: 1
+      default:
+      - action: script.guardian_restore_lamp
+        continue_on_error: true
+        data:
+          # "off" or "on|<brightness>|<kelvin>". prev_rgb is deliberately omitted:
+          # guardian_restore_lamp prefers rgb when it is present, and the stash
+          # cannot carry a tuple through an input_text without quoting games.
+          was_on: "{{ stash.split('|')[0] == 'on' }}"
+          prev_brightness: "{{ (stash.split('|')[1] | int(255))
+            if '|' in stash else 255 }}"
+          prev_kelvin: "{{ (stash.split('|')[2] | int(0)) if stash.split('|') | count
+            > 2 else 0 }}"
     - action: input_text.set_value
       target:
         entity_id: input_text.guardian_lamp_presample
       data:
         value: none
-    - action: persistent_notification.create
+    # An interrupted sample IS a measurement failure - it produced no reading -
+    # so it is FAILED and it counts toward the streak like any other. What it no
+    # longer does is notify on the first occurrence: one hung cloud call at dusk
+    # is not a broken system, three in a row is, and that is the same threshold
+    # LUMA, the sampler's own notification and the phone push use.
+    - action: input_text.set_value
+      target:
+        entity_id: input_text.guardian_lamp_last_result
       data:
-        notification_id: guardian_lamp_sample_stuck
-        title: 'Guardian: ambient light sample did not finish'
-        message: >-
-          A sample was interrupted with the lamp switched off for measurement.
-          The lamp has been restored to "{{ stash }}". If this recurs, the
-          camera snapshot or the luminance sensor is hanging - see
-          input_text.guardian_lamp_last_result.
+        value: >-
+          {{ now().strftime('%H:%M') }} FAILED interrupted
+          {{- ' on_sun' if night | bool else ' restored' }}
+    - action: input_number.set_value
+      target:
+        entity_id: input_number.guardian_lamp_fail_streak
+      data:
+        value: "{{ [(states('input_number.guardian_lamp_fail_streak') | int(0)
+          + 1), 99] | min }}"
+    - if:
+      - condition: template
+        value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
+          >= 3 }}"
+      then:
+      - action: persistent_notification.create
+        continue_on_error: true
+        data:
+          notification_id: guardian_lamp_sample_stuck
+          title: 'Guardian: ambient light sample did not finish'
+          message: >-
+            A sample was interrupted with the lamp switched off for measurement,
+            and the last {{ states('input_number.guardian_lamp_fail_streak') | int(0) }}
+            samples produced no reading. The lamp was
+            {{ 'switched on, because it is night' if night | bool
+               else 'restored to "' ~ stash ~ '"' }}. If this keeps happening,
+            the camera snapshot, the luminance sensor or the bulb itself is
+            hanging - see input_text.guardian_lamp_last_result.
   mode: restart
 - id: '1787145600001'
   alias: 'Guardian: Lamp Sun-Mismatch Fallback'

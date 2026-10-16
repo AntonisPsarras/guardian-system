@@ -1617,6 +1617,11 @@ guardian_restore_lamp:
           {{ s in ['(255,150,0)', '[255,150,0]', '(255,0,0)', '[255,0,0]',
                    '(0,255,0)', '[0,255,0]'] }}
         {%- endif %}
+  # Every light call below is guarded. This script is called blocking by the
+  # sampler, the feedback queue, the challenge hold and the sampling watchdog,
+  # so a cloud bulb raising here used to end the CALLER - most visibly the
+  # sampler, mid-blackout, leaving the porch dark until the watchdog put back
+  # whatever the stash said.
   - choose:
     - conditions:
       - condition: template
@@ -1630,6 +1635,7 @@ guardian_restore_lamp:
               and not (rgb_hold | bool) }}'
           sequence:
           - action: light.turn_on
+            continue_on_error: true
             target:
               entity_id: "{{ lamp }}"
             data:
@@ -1642,6 +1648,7 @@ guardian_restore_lamp:
               0 }}'
           sequence:
           - action: light.turn_on
+            continue_on_error: true
             target:
               entity_id: "{{ lamp }}"
             data:
@@ -1658,12 +1665,14 @@ guardian_restore_lamp:
               value_template: '{{ rgb_hold | bool }}'
             sequence:
             - action: light.turn_off
+              continue_on_error: true
               target:
                 entity_id: "{{ lamp }}"
               data:
                 transition: 0
           default:
           - action: light.turn_on
+            continue_on_error: true
             target:
               entity_id: "{{ lamp }}"
             data:
@@ -1671,6 +1680,7 @@ guardian_restore_lamp:
               transition: 0
     default:
     - action: light.turn_off
+      continue_on_error: true
       target:
         entity_id: "{{ lamp }}"
       data:
@@ -2625,6 +2635,7 @@ guardian_apply_lamp_sun_mismatch:
         value_template: '{{ night }}'
       sequence:
       - action: light.turn_on
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -2644,6 +2655,7 @@ guardian_apply_lamp_sun_mismatch:
         value_template: '{{ day }}'
       sequence:
       - action: light.turn_off
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -2850,7 +2862,10 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED already_running hold"
+        # HELD, not FAILED - see the alarm hold just below for why the word
+        # matters. A stuck flag is the watchdog's to clear, and it records its
+        # own FAILED interrupted when it does.
+        value: "{{ now().strftime('%H:%M') }} HELD already_running"
     - stop: Sample already running, or the sampling flag is stuck on
   - if:
     - condition: template
@@ -2873,8 +2888,10 @@ guardian_sample_ambient_light:
         # now raises one on a scan, which is what surfaced it.
         #
         # The sibling holds above and below (already_running, challenge,
-        # feedback) are the same class of non-failure and still say FAILED.
-        # Left alone deliberately - they are not on this path.
+        # feedback, lamp_offline, no_lamp) are the same class of non-failure
+        # and said FAILED until the forty-eighth pass, which is how a Tapo that
+        # dropped off Wi-Fi at dusk lit LUMA every ten minutes. They are HELD
+        # now too; only a sample that produced no usable reading says FAILED.
         value: "{{ now().strftime('%H:%M') }} HELD alarm"
     - stop: Alarm owns the lamp
   - if:
@@ -2886,7 +2903,7 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED challenge hold"
+        value: "{{ now().strftime('%H:%M') }} HELD challenge"
     - stop: Challenge owns the lamp
   - if:
     - condition: state
@@ -2897,8 +2914,22 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED feedback hold"
+        value: "{{ now().strftime('%H:%M') }} HELD feedback"
     - stop: Lamp feedback flash in progress
+  # THE LAMP BEING OFFLINE IS NOT A MEASUREMENT FAILURE, and reporting it as one
+  # is what the household saw at dusk: "FAILED lamp_unavailable hold", a fail
+  # streak increment and a fresh "ambient light sampling failed" notification
+  # on every ten-minute tick - ten, because a lamp that is off (or offline)
+  # samples on the fast cadence. A Tapo that dropped off its cloud for a minute,
+  # or a porch bulb switched off at the wall, was rendered as a broken sensor
+  # chain and lit LUMA on the panel and the portal.
+  #
+  # Nothing was measured and nothing could be switched, so this is a hold: it is
+  # recorded, it does not touch the streak, and it does not notify. The camera
+  # and the probe are not implicated. "Guardian: Camera-Based Lamp Control"
+  # samples again within ~30s of the bulb coming back (its lamp_back trigger),
+  # which is where the sun fallback this used to skip actually gets applied -
+  # there is no bulb to apply it to while it is offline.
   - if:
     - condition: template
       value_template: '{{ not lamp_ok }}'
@@ -2907,22 +2938,9 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED lamp_unavailable hold"
-    - action: input_number.set_value
-      target:
-        entity_id: input_number.guardian_lamp_fail_streak
-      data:
-        value: "{{ [(states('input_number.guardian_lamp_fail_streak') | int(0)
-          + 1), 99] | min }}"
-    - action: persistent_notification.create
-      data:
-        notification_id: guardian_luminance_unusable
-        title: 'Guardian: ambient light sampling failed'
-        message: >-
-          The configured lamp (sensor.guardian_lamp_entity) is unknown or
-          unavailable, so the sampler cannot
-          switch it. Last result:
-          {{ states('input_text.guardian_lamp_last_result') }}.
+        value: >-
+          {{ now().strftime('%H:%M') }} HELD
+          {{- ' no_lamp' if lamp in ['none', '', 'unknown', 'unavailable'] else ' lamp_offline' }}
     - stop: Lamp entity is not ready
   - if:
     - condition: template
@@ -2938,7 +2956,12 @@ guardian_sample_ambient_light:
         - condition: template
           value_template: "{{ abort_decision | trim == 'on_sun' }}"
         sequence:
+        # Guarded like every lamp call in this script since the forty-eighth
+        # pass: a cloud bulb that answers "unavailable" mid-call raises
+        # HomeAssistantError, which ended the run before the verdict was
+        # written. The `none` sentinel above already covers vol.Invalid.
         - action: light.turn_on
+          continue_on_error: true
           target:
             entity_id: "{{ lamp }}"
           data:
@@ -2953,6 +2976,7 @@ guardian_sample_ambient_light:
           value_template: "{{ abort_decision | trim == 'off_sun' }}"
         sequence:
         - action: light.turn_off
+          continue_on_error: true
           target:
             entity_id: "{{ lamp }}"
           data:
@@ -2971,32 +2995,50 @@ guardian_sample_ambient_light:
       data:
         value: "{{ [(states('input_number.guardian_lamp_fail_streak') | int(0)
           + 1), 99] | min }}"
-    - action: persistent_notification.create
-      data:
-        notification_id: guardian_luminance_unusable
-        title: 'Guardian: ambient light sampling failed'
-        message: >-
-          No usable camera for a snapshot (helper
-          "{{ states('input_text.guardian_camera_entity') }}", resolved
-          "{{ camera_entity }}"). The lamp fell back to sun elevation and was
-          {{ 'switched on' if abort_decision | trim == 'on_sun'
-             else ('switched off' if abort_decision | trim == 'off_sun'
-             else 'left as it was') }}. Set More → Install to camera.door_camera
-          and Save. See DEPLOY.md.
+    # One failed sample is routine (the Frigate/Tapo integration drops the
+    # camera entity for a minute fairly often) and the verdict above already
+    # records it. Three in a row is the same threshold LUMA and the phone push
+    # use, so the notification, the badge and the push now all mean the same
+    # thing: the measurement chain is genuinely broken.
+    - if:
+      - condition: template
+        value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
+          >= 3 }}"
+      then:
+      - action: persistent_notification.create
+        continue_on_error: true
+        data:
+          notification_id: guardian_luminance_unusable
+          title: 'Guardian: ambient light sampling failed'
+          message: >-
+            No usable camera for a snapshot (helper
+            "{{ states('input_text.guardian_camera_entity') }}", resolved
+            "{{ camera_entity }}") for
+            {{ states('input_number.guardian_lamp_fail_streak') | int(0) }}
+            samples in a row. The lamp fell back to sun elevation and was
+            {{ 'switched on' if abort_decision | trim == 'on_sun'
+               else ('switched off' if abort_decision | trim == 'off_sun'
+               else 'left as it was') }}. Set More → Install to camera.door_camera
+            and Save. See DEPLOY.md.
+    # script.turn_on, not a blocking call: a phone fan-out must not hold the
+    # sampling flag open towards the 60s watchdog.
     - if:
       - condition: template
         value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
           == 3 }}"
       then:
-      - action: script.guardian_notify_broadcast
+      - action: script.turn_on
         continue_on_error: true
+        target:
+          entity_id: script.guardian_notify_broadcast
         data:
-          category: system
-          severity: routine
-          title: '⚠️ Guardian: ambient light sampling broken'
-          message: >-
-            Three consecutive failed readings. The lamp is running on sun
-            elevation alone. Check input_text.guardian_camera_entity.
+          variables:
+            category: system
+            severity: routine
+            title: '⚠️ Guardian: ambient light sampling broken'
+            message: >-
+              Three consecutive failed readings. The lamp is running on sun
+              elevation alone. Check input_text.guardian_camera_entity.
     - stop: Camera entity is not ready
   - action: input_boolean.turn_on
     target:
@@ -3014,7 +3056,18 @@ guardian_sample_ambient_light:
       value: >-
         {{ ('on|' ~ prev_brightness | int(255) ~ '|' ~ (prev_kelvin | int(0)))
            if was_on | bool else 'off' }}
+  # EVERY lamp call from here to the end of the run is guarded, and that is the
+  # dusk failure the household reported. A cloud bulb that times out or drops
+  # to unavailable mid-call raises HomeAssistantError; unguarded, that ended the
+  # run with guardian_lamp_sampling still on, and "Guardian: Lamp Sampling
+  # Watchdog" restored the pre-sample stash sixty seconds later - which at dusk
+  # is "off", so the porch went dark at exactly the moment the sampler had
+  # decided to light it. The lamp is the actuator, not the measurement: a call
+  # that fails is recorded by the verdict below and retried on the next tick,
+  # never allowed to end the sample. vol.Invalid is not in play - `lamp` is
+  # always a valid id or the `none` sentinel.
   - action: light.turn_off
+    continue_on_error: true
     target:
       entity_id: "{{ lamp }}"
     data:
@@ -3213,6 +3266,7 @@ guardian_sample_ambient_light:
           'on_sun_override'] }}"
       sequence:
       - action: light.turn_on
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -3233,6 +3287,7 @@ guardian_sample_ambient_light:
           'off_sun_override', 'off_day_hold'] }}"
       sequence:
       - action: light.turn_off
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -3241,6 +3296,7 @@ guardian_sample_ambient_light:
     # exactly as it was. Daytime band readings are off_day_hold above, not here.
     default:
     - action: script.guardian_restore_lamp
+      continue_on_error: true
       data:
         was_on: '{{ was_on }}'
         prev_brightness: '{{ prev_brightness }}'
@@ -3296,40 +3352,61 @@ guardian_sample_ambient_light:
     else:
     # The fixed notification_id makes this self-replacing, so a persistently
     # broken sampler produces one notification, not one per run.
-    - action: persistent_notification.create
-      data:
-        notification_id: guardian_luminance_unusable
-        title: 'Guardian: ambient light sampling failed'
-        message: >-
-          sensor.guardian_camera_luminance did not produce a fresh number.
-          Reading: {{ states('sensor.guardian_camera_luminance') }}. The lamp
-          fell back to sun elevation and was {{
-            'switched on' if decision | trim == 'on_sun'
-            else ('switched off' if decision | trim == 'off_sun'
-            else 'left as it was') }}. Check, in order:
-          /config/guardian/ exists and is writable; guardian-luminance.py is at
-          /config/guardian/; the camera entity
-          input_text.guardian_camera_entity is correct. See DEPLOY.md.
+    #
+    # And only from the third failure in a row. One miss is the camera
+    # integration blinking, and the verdict line above already records it; a
+    # notification per miss is what made this card a fixture at dusk. Three is
+    # the threshold LUMA and the phone push below already used.
+    - if:
+      - condition: template
+        value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
+          >= 3 }}"
+      then:
+      - action: persistent_notification.create
+        continue_on_error: true
+        data:
+          notification_id: guardian_luminance_unusable
+          title: 'Guardian: ambient light sampling failed'
+          message: >-
+            sensor.guardian_camera_luminance did not produce a fresh number for
+            {{ states('input_number.guardian_lamp_fail_streak') | int(0) }}
+            samples in a row. Reading:
+            {{ states('sensor.guardian_camera_luminance') }}. The lamp fell back
+            to sun elevation and was {{
+              'switched on' if decision | trim == 'on_sun'
+              else ('switched off' if decision | trim == 'off_sun'
+              else 'left as it was') }}. Check, in order:
+            /config/guardian/ exists and is writable; guardian-luminance.py is at
+            /config/guardian/; the camera entity
+            input_text.guardian_camera_entity is correct. See DEPLOY.md.
     # A persistent notification is a badge in the web UI that is easy never to
     # look at - which is how a sampler that had never once worked went unnoticed
     # for months. Three consecutive failures means the chain is genuinely broken
     # rather than the Tapo integration having dropped the camera for one run, so
     # escalate to the phones. Exactly once: the streak only equals 3 on one run.
+    #
+    # script.turn_on, not a blocking call. This still runs with
+    # guardian_lamp_sampling on, and a serial phone fan-out over the network
+    # could hold that flag past the 60s watchdog, which then "recovered" a
+    # sample that had already finished.
     - if:
       - condition: template
         value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
           == 3 }}"
       then:
-      - action: script.guardian_notify_broadcast
+      - action: script.turn_on
         continue_on_error: true
+        target:
+          entity_id: script.guardian_notify_broadcast
         data:
-          category: system
-          severity: routine
-          title: '⚠️ Guardian: ambient light sampling broken'
-          message: >-
-            Three consecutive failed readings. The lamp is running on sun
-            elevation alone. See the Guardian notification in Home Assistant
-            for what to check.
+          variables:
+            category: system
+            severity: routine
+            title: '⚠️ Guardian: ambient light sampling broken'
+            message: >-
+              Three consecutive failed readings. The lamp is running on sun
+              elevation alone. See the Guardian notification in Home Assistant
+              for what to check.
   # An override means the camera produced a perfectly good number that
   # contradicts the sky. The lamp is now correct either way, but the
   # measurement is not. on_sun_override at night is almost always unconfigured
@@ -3386,22 +3463,28 @@ guardian_sample_ambient_light:
   # from_sampler is required: the sampling flag is still on, and the independent
   # tick treats that flag as "do not force".
   - action: script.guardian_apply_lamp_sun_mismatch
+    continue_on_error: true
     data:
       from_sampler: true
       luminance_valid: '{{ luminance_valid }}'
       luminance: '{{ luminance }}'
+  # Non-blocking for the same reason as the streak push above. The message is
+  # rendered here, at call time, so it still carries this sample's verdict.
   - if:
     - condition: state
       entity_id: input_boolean.guardian_verbose_notifications
       state: 'on'
     then:
-    - action: script.guardian_notify_broadcast
+    - action: script.turn_on
       continue_on_error: true
+      target:
+        entity_id: script.guardian_notify_broadcast
       data:
-        category: system
-        severity: routine
-        title: 'Guardian: lamp'
-        message: "{{ states('input_text.guardian_lamp_last_result') }}"
+        variables:
+          category: system
+          severity: routine
+          title: 'Guardian: lamp'
+          message: "{{ states('input_text.guardian_lamp_last_result') }}"
   - action: input_boolean.turn_off
     target:
       entity_id: input_boolean.guardian_lamp_sampling
