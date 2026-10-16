@@ -284,6 +284,9 @@ const E = {
   mfaFails: 'input_number.mfa_failed_attempts',
   entryChallenge: 'input_boolean.guardian_entry_challenge',
   challengeOrigin: 'input_text.guardian_challenge_origin',
+  // Written by process_rfid_scan on every card scan; read-only here.
+  lastScan: 'input_text.guardian_last_scan',
+  lastEntry: 'input_text.guardian_last_entry',
   challengeSeconds: 'input_number.guardian_entry_challenge_seconds',
   challengeCardOk: 'input_boolean.guardian_challenge_card_ok',
   challengePinOk: 'input_boolean.guardian_challenge_pin_ok',
@@ -442,6 +445,10 @@ const ALIASES = {
  * stranded challenge or a lost passage window happens. Tap opens Home
  * Assistant's own more-info dialog, which is where an edit belongs. */
 const INTERNALS = [
+  /* First, because it is the row to read when a key "was refused": reader,
+   * slot, verdict, reported and stored counter, rotate and window. */
+  [E.lastScan, 'Last card scan'],
+  [E.lastEntry, 'Last completed entry'],
   [E.display, 'Portal display state'],
   [E.displaySeq, 'Display sequence'],
   [E.pendingEntry, 'Pending entry slots'],

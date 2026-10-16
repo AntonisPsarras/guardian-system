@@ -481,6 +481,28 @@ input_text:
     name: Guardian Last Door Summary
     initial: none
     max: 64
+  # "<slots>|<epoch seconds>" of the last completed ENTRY: written by
+  # "Guardian: Complete Authorized Passage" for an entry and by
+  # script.guardian_clear_entry_challenge. process_rfid_scan reads it so the
+  # same card tapped on the interior portal within three minutes, before the
+  # door is shut, finishes that entry instead of starting an exit window or a
+  # fresh MFA. Session state, so `initial: none` is right: after a restart
+  # there is no entry in progress.
+  guardian_last_entry:
+    name: Guardian Last Entry
+    initial: none
+    max: 64
+  # One line per card scan, always written by process_rfid_scan:
+  # "21:04:13 portal slot 2 ENTRY_DONE r=ok c=41 s=40 rot=1 win=1". Reader,
+  # slot, verdict, the reader's result and counter, the counter Home Assistant
+  # held before the scan, whether the card rotated, and whether the freshness
+  # window accepted it. The next "my key was refused" is diagnosable from this
+  # line alone, without having switched verbose notifications on beforehand.
+  # NO `initial:` - it has to survive the restart somebody does while trying
+  # to fix the problem it describes.
+  guardian_last_scan:
+    name: Guardian Last Card Scan
+    max: 255
   # The lamp's state immediately BEFORE a sample blacks the bulb out, as
   # "off" or "on|<brightness>|<kelvin>".
   #

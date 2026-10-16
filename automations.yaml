@@ -1876,6 +1876,21 @@
       direction: '{{ trigger.id }}'
       slots: '{{ slots | join(",") }}'
       timestamp: '{{ now().isoformat() }}'
+  # Who just came in, and when. process_rfid_scan reads this to recognise the
+  # same card tapped on the interior portal before the door is shut as the end
+  # of THIS entry - not an exit, and not a reason for a fresh MFA. After the
+  # event above so the supervisor's 3 s wait is not delayed by it; guarded
+  # because it is bookkeeping and must not stop the presence writes below.
+  - if:
+    - condition: template
+      value_template: "{{ trigger.id == 'entry' }}"
+    then:
+    - action: input_text.set_value
+      continue_on_error: true
+      target:
+        entity_id: input_text.guardian_last_entry
+      data:
+        value: "{{ slots | join(',') }}|{{ as_timestamp(now()) | int(0) }}"
   - repeat:
       for_each: '{{ slots }}'
       sequence:

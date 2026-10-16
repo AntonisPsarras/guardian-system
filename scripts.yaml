@@ -140,7 +140,9 @@ process_rfid_scan:
       description: doorbell or interior_portal
       required: true
     result:
-      description: ok, enrolled, write_fail, bad_mac, or unsupported_tag
+      description: >-
+        ok, enrolled, write_fail, bad_mac, unsupported_tag, or read_fail (the
+        reader gave up on a link error; no card_id, no verdict about the card)
       required: false
     card_id:
       description: 16-character hex card_id from the on-card authenticator
@@ -377,6 +379,14 @@ process_rfid_scan:
       presence_before: >-
         {% set i = matched_slot | string | trim %}
         {{ states('input_select.rfid_' ~ i) | string | trim }}
+      # The counter Home Assistant held BEFORE this scan, for the verdict line
+      # below. The comparison that decides CLONE is this number against the
+      # reported one, so a diagnostic that only showed the value after the
+      # write could not explain its own verdict. -1 when nothing matched; the
+      # conditional keeps a junk entity id away from states().
+      stored_before: >-
+        {% set i = matched_slot | string | trim %}
+        {{ (states('input_number.rfid_' ~ i ~ '_counter') | int(0)) if i else -1 }}
       door_closed: "{{ is_state('binary_sensor.guardian_interior_portal_door_contact', 'off') }}"
       # Exterior reader, door shut, elevated: the keypad is unreachable. Either
       # a live 30s challenge (they just walked out) or presence still At home
@@ -419,73 +429,6 @@ process_rfid_scan:
           Stolen key: {{ matched_name if matched_name else 'Key ' ~
           (matched_slot | string | trim) }} at {{ 'door' if source == 'doorbell'
           else 'portal' }}
-  # Decision trace. OFF unless input_boolean.guardian_verbose_notifications is on.
-  #
-  # This lives HERE, inside the script, rather than in an automation watching the
-  # event, because it has to report the variables the choose below will actually
-  # branch on. Every other vantage point - the device log, the event bus, a
-  # template sensor - shows an input to this decision rather than the decision,
-  # and the failures being chased have all been cases where the inputs looked
-  # right and the outcome was still wrong.
-  #
-  # It names the branch outright, computed from the same conditions in the same
-  # order, so "which branch ran" stops being an inference from an LED colour.
-  - if:
-    - condition: state
-      entity_id: input_boolean.guardian_verbose_notifications
-      state: 'on'
-    then:
-    # continue_on_error: this is a diagnostic, and it sits in front of every
-    # alert the scan can raise - the stolen-key alarm, the clone push and the
-    # clone alarm all come after it. A trace that can cancel the thing it exists
-    # to explain is worse than no trace.
-    - action: persistent_notification.create
-      continue_on_error: true
-      data:
-        notification_id: "guardian_scan_trace_{{ now().strftime('%H%M%S') }}"
-        title: >-
-          {{ now().strftime('%H:%M:%S') }} {{ source }} ->
-          {%- set m = matched_slot | string | trim -%}
-          {%- set valid = slot_ok | bool -%}
-          {% if valid and states('input_select.rfid_' ~ m)
-                in ['Stolen', 'Stolen/Lost'] %} STOLEN
-          {%- elif doorbell_exit | bool %} DOORBELL EXIT PIN
-          {%- elif challenge_active | bool and valid %} CHALLENGE CARD
-          {%- elif enroll_mode | bool and valid %} ENROLL_DUP
-          {%- elif valid and not (window_ok | bool) and scan_result not in ['', 'enrolled'] %} CLONE
-          {%- elif enroll_hold | bool %} HOLD
-          {%- elif valid and elevated_mode | bool %} MFA
-          {%- elif valid %} GRANTED (passage)
-          {%- elif enroll_mode | bool and tag_unsupported | bool %} UNSUPPORTED
-          {%- elif enroll_mode | bool and enroll_hold | bool %} HOLD
-          {%- elif enroll_mode | bool and target_ok | bool %} ENROLL -> slot {{ target_slot | string | trim }}
-          {%- elif enroll_mode | bool %} ENROLL_PICK (no target slot)
-          {%- elif tag_unsupported | bool %} UNSUPPORTED
-          {%- else %} DENIED_CARD{% endif %}
-        message: >-
-          result: {{ scan_result }}
-          · card_id_len: {{ card_id_norm | length }}
-          · counter: {{ counter_n }}
-          · rotated: {{ rotated_b }}
-          · window: {{ window_ok }}
-
-          matched_slot: '{{ matched_slot | string | trim }}'
-          · empty_slot: '{{ empty_slot | trim }}'
-          · target_slot: '{{ target_slot | string | trim }}'
-
-          enroll_mode: {{ enroll_mode }}
-          · guest: {{ enroll_as_visitor }}
-          · elevated: {{ elevated_mode }}
-          · challenge: {{ challenge_active }}
-          · doorbell_exit: {{ doorbell_exit }}
-          · presence_before: '{{ presence_before }}'
-
-          enrollment_slot helper: '{{ states('input_text.guardian_enrollment_slot') }}'
-
-          stored: {% set ids = (states('sensor.guardian_rfid_slots') | string).split(',')
-                               | map('trim') | reject('eq', '') | list %}{% for i in ids %}{{ i }}={{
-            states('input_text.rfid_' ~ i ~ '_card_id') | string | trim | lower | length }}ch/c{{
-            states('input_number.rfid_' ~ i ~ '_counter') | int(0) }} {% endfor %}
   # Self-correction, before any branch. The reader a card was presented to tells
   # us which side of the door that card is physically on, so a card recorded as
   # "Away" and scanned on the interior portal - or "At home" and scanned at the
@@ -530,6 +473,164 @@ process_rfid_scan:
       counter_ok: "{{ (not (slot_ok | bool) or not (rotated_b | bool)) or
         (states('input_number.rfid_' ~ (matched_slot | string | trim) ~ '_counter')
          | int(0) >= (counter_n | int(0))) }}"
+  # AN INTERIOR TAP DURING AN ENTRY IS THE SAME PERSON FINISHING IT.
+  #
+  # The household's report: come in from outside (doorbell scan, door open),
+  # tap the same card on the interior portal before the door is shut, and from
+  # then on the system "rejects" it. Two things were going wrong, and this is
+  # the Home Assistant half (the other is a torn MAC write, healed on the
+  # readers). The interior reader is only ever read as EXIT intent, so:
+  #
+  #   * outside elevated mode it opened a 20 s exit window against a door that
+  #     was already open. No opening could follow to complete it, it expired,
+  #     and if the door was opened again inside those 20 s - fetching the
+  #     shopping - that was booked as this person leaving;
+  #   * in elevated mode it started a fresh MFA after the person had already
+  #     authenticated their way in, put MFA on the screen instead of GRANTED,
+  #     and then ended in a major alarm either way: the MFA timed out, or the
+  #     right PIN was typed with the door open, which the PIN handler treated
+  #     as an unsupervised opening.
+  #
+  # Modelled explicitly: this slot completed an entry in the last three minutes
+  # (input_text.guardian_last_entry, written by "Guardian: Complete Authorized
+  # Passage" and by guardian_clear_entry_challenge), the scan is at the interior
+  # reader, the door is still open or shut within the last 15 s, and no MFA,
+  # challenge or doorbell-exit PIN is pending. Then the tap is acknowledged and
+  # nothing else is started. Clone, stolen and HOLD verdicts still win - they
+  # are earlier in the choose, and this branch requires a clean counter.
+  #
+  # The door reads are behind is_state() short-circuits, so a missing contact
+  # entity is "false", never a TemplateError in front of the choose.
+  - variables:
+      entry_finish: >-
+        {% set m = matched_slot | string | trim %}
+        {% set raw = states('input_text.guardian_last_entry') | string | trim %}
+        {% set parts = raw.split('|') %}
+        {% set who = (parts[0].split(',') | map('trim') | reject('eq', '') | list)
+             if parts | count == 2 else [] %}
+        {% set at = (parts[1] | float(0)) if parts | count == 2 else 0 %}
+        {% set door_on = is_state('binary_sensor.guardian_interior_portal_door_contact', 'on') %}
+        {% set door_just_shut = is_state('binary_sensor.guardian_interior_portal_door_contact', 'off')
+             and (as_timestamp(now()) - as_timestamp(
+                  states.binary_sensor.guardian_interior_portal_door_contact.last_changed, 0)) <= 15 %}
+        {{ source == 'interior_portal' and (slot_ok | bool) and m in who
+           and (as_timestamp(now()) - at) <= 180
+           and (door_on or door_just_shut)
+           and (counter_ok | bool) and scan_result in ['', 'ok']
+           and not is_state('input_boolean.portal_mfa_pending', 'on')
+           and not is_state('input_boolean.guardian_entry_challenge', 'on')
+           and not is_state('input_boolean.guardian_doorbell_exit_pin', 'on') }}
+  # ONE VERDICT, computed from the same conditions in the same order as the
+  # choose below. The decision trace used to carry its own copy of this ladder,
+  # and it had drifted from the choose (STOLEN and DOORBELL EXIT ahead of CLONE,
+  # no HOLD for a counter that did not save), so the one tool for "which branch
+  # ran" could name the wrong one. The trace and the durable last-scan line now
+  # both print this. If you add a branch to the choose, add it here in the same
+  # place.
+  - variables:
+      verdict: >-
+        {% set m = matched_slot | string | trim %}
+        {% set valid = slot_ok | bool %}
+        {% set stolen = valid and states('input_select.rfid_' ~ m) in ['Stolen', 'Stolen/Lost'] %}
+        {% if scan_result == 'read_fail' %}READ_FAIL
+        {%- elif tag_unsupported | bool %}UNSUPPORTED
+        {%- elif valid and scan_result not in ['', 'enrolled'] and not (window_ok | bool)
+                 and not stolen %}CLONE
+        {%- elif enroll_mode | bool and not valid and enroll_hold | bool %}HOLD
+        {%- elif stolen %}STOLEN
+        {%- elif valid and rotated_b | bool and not (counter_ok | bool) %}HOLD_COUNTER
+        {%- elif enroll_hold | bool and valid %}HOLD
+        {%- elif doorbell_exit | bool and valid %}DOORBELL_EXIT_PIN
+        {%- elif challenge_active | bool and valid %}CHALLENGE_CARD
+        {%- elif enroll_mode | bool and valid %}ENROLL_DUP
+        {%- elif entry_finish | bool %}ENTRY_DONE
+        {%- elif valid and elevated_mode | bool %}MFA
+        {%- elif valid and counter_ok | bool and scan_result in ['', 'ok'] %}GRANTED
+        {%- elif enroll_mode | bool and target_ok | bool
+                 and not (card_id_norm | length == 16 and card_id_norm is match('^[0-9a-f]{16}$')) %}HOLD
+        {%- elif enroll_mode | bool and target_ok | bool %}ENROLL
+        {%- elif enroll_mode | bool %}ENROLL_PICK
+        {%- else %}DENIED_CARD{% endif %}
+  # THE LAST SCAN, IN ONE LINE THAT SURVIVES A RESTART. "Random" denials have
+  # cost more than one pass because the evidence was a persistent notification
+  # that only existed with verbose mode switched on beforehand. This is always
+  # written: reader, slot, verdict, reported result, reported counter, the
+  # counter Home Assistant held before the scan, whether the reader rotated, and
+  # whether the freshness window accepted it - which is everything needed to
+  # tell HOLD from CLONE from a read failure from a counter desync, and is shown
+  # on More -> Internals. No `initial:` on the helper, so the morning after
+  # still has it. Guarded, and built only from this script's own variables.
+  - action: input_text.set_value
+    continue_on_error: true
+    target:
+      entity_id: input_text.guardian_last_scan
+    data:
+      value: >-
+        {%- set m = matched_slot | string | trim -%}
+        {{ (now().strftime('%H:%M:%S') ~ ' ' ~ ('door' if source == 'doorbell' else 'portal')
+            ~ ' ' ~ (('slot ' ~ m) if slot_ok | bool else 'no-match')
+            ~ ' ' ~ (verdict | string | trim)
+            ~ ' r=' ~ (scan_result if scan_result else 'none')
+            ~ ' c=' ~ (counter_n | string)
+            ~ ' s=' ~ (stored_before | string)
+            ~ ' rot=' ~ ('1' if rotated_b | bool else '0')
+            ~ ' win=' ~ ('1' if window_ok | bool else '0'))[:255] }}
+  # Decision trace. OFF unless input_boolean.guardian_verbose_notifications is on.
+  #
+  # This lives HERE, inside the script, rather than in an automation watching the
+  # event, because it has to report the variables the choose below will actually
+  # branch on. Every other vantage point - the device log, the event bus, a
+  # template sensor - shows an input to this decision rather than the decision,
+  # and the failures being chased have all been cases where the inputs looked
+  # right and the outcome was still wrong.
+  #
+  # It names the branch outright from `verdict` above. It used to sit in front
+  # of reconcile and the counter write with its own ladder, which could not see
+  # counter_ok and had drifted from the choose; it moved down here in the
+  # forty-eighth pass so it reports the decision the choose is about to make.
+  - if:
+    - condition: state
+      entity_id: input_boolean.guardian_verbose_notifications
+      state: 'on'
+    then:
+    # continue_on_error: this is a diagnostic, and it sits in front of the clone
+    # push and the clone alarm. A trace that can cancel the thing it exists to
+    # explain is worse than no trace.
+    - action: persistent_notification.create
+      continue_on_error: true
+      data:
+        notification_id: "guardian_scan_trace_{{ now().strftime('%H%M%S') }}"
+        title: >-
+          {{ now().strftime('%H:%M:%S') }} {{ source }} -> {{ verdict | string | trim }}
+          {%- if (verdict | string | trim) in ['ENROLL'] %} slot {{ target_slot | string | trim }}{% endif %}
+        message: >-
+          result: {{ scan_result }}
+          · card_id_len: {{ card_id_norm | length }}
+          · counter: {{ counter_n }}
+          · stored before: {{ stored_before }}
+          · rotated: {{ rotated_b }}
+          · window: {{ window_ok }}
+          · counter_ok: {{ counter_ok }}
+
+          matched_slot: '{{ matched_slot | string | trim }}'
+          · empty_slot: '{{ empty_slot | trim }}'
+          · target_slot: '{{ target_slot | string | trim }}'
+
+          enroll_mode: {{ enroll_mode }}
+          · guest: {{ enroll_as_visitor }}
+          · elevated: {{ elevated_mode }}
+          · challenge: {{ challenge_active }}
+          · doorbell_exit: {{ doorbell_exit }}
+          · entry_finish: {{ entry_finish }}
+          · presence_before: '{{ presence_before }}'
+
+          enrollment_slot helper: '{{ states('input_text.guardian_enrollment_slot') }}'
+          · last entry: '{{ states('input_text.guardian_last_entry') }}'
+
+          stored: {% set ids = (states('sensor.guardian_rfid_slots') | string).split(',')
+                               | map('trim') | reject('eq', '') | list %}{% for i in ids %}{{ i }}={{
+            states('input_text.rfid_' ~ i ~ '_card_id') | string | trim | lower | length }}ch/c{{
+            states('input_number.rfid_' ~ i ~ '_counter') | int(0) }} {% endfor %}
   # WHETHER THIS KEY IS PASSWORD-PROTECTED ON THE CARD. Recorded here, shown in
   # the panel's key list, and USED FOR NOTHING ELSE.
   #
@@ -584,6 +685,31 @@ process_rfid_scan:
                 + [slot ~ ('u' if protected_norm == 'false' else 'p')] -%}
           {{- ns.out | sort | join(',') -}}
   - choose:
+    # The reader could not complete the exchange - a garbled frame it retried
+    # until its budget ran out, a PWD_AUTH frame lost in the noise, a tag at the
+    # edge of the field that never answered SELECT cleanly. That is about the
+    # radio, not the card, so it carries no card_id and must reach no verdict:
+    # it used to arrive as unsupported_tag (UNSUPPORTED) or bad_mac (HOLD with
+    # re-enroll advice) about a key that was perfectly good. HOLD, retap. No
+    # event, no push; the always-on last-scan line above records it.
+    - conditions:
+      - condition: template
+        value_template: "{{ scan_result == 'read_fail' }}"
+      sequence:
+      - action: script.guardian_set_display
+        data:
+          value: HOLD
+      - action: button.press
+        continue_on_error: true
+        target:
+          entity_id: button.guardian_interior_portal_play_denied
+      - if:
+        - condition: template
+          value_template: '{{ enroll_mode | bool }}'
+        then:
+        - action: timer.start
+          target:
+            entity_id: timer.guardian_enrollment_window
     - conditions:
       - condition: template
         value_template: '{{ tag_unsupported | bool }}'
@@ -946,6 +1072,25 @@ process_rfid_scan:
       - action: timer.start
         target:
           entity_id: timer.guardian_enrollment_window
+    # The person who just came in, tapping inside before the door is shut. See
+    # entry_finish above: acknowledge, and start nothing - no exit window for a
+    # door that is already open, and no fresh MFA for someone who has already
+    # authenticated this opening. Placed before the elevated MFA branch, which
+    # is the one it exists to keep this tap out of.
+    - conditions:
+      - condition: template
+        value_template: '{{ entry_finish | bool }}'
+      sequence:
+      - action: script.guardian_set_display
+        data:
+          value: GRANTED
+      - action: button.press
+        continue_on_error: true
+        target:
+          entity_id: button.guardian_interior_portal_play_welcome
+      - action: script.turn_on
+        target:
+          entity_id: script.guardian_lamp_success
     - conditions:
       - condition: template
         value_template: '{{ slot_ok | bool }}'
@@ -2094,6 +2239,53 @@ guardian_clear_entry_challenge:
       origin: '{{ origin }}'
       detail: "{{ detail | default('', true) }}"
       timestamp: '{{ now().isoformat() }}'
+  # The authenticated slot owns this opening. Recorded for process_rfid_scan's
+  # entry_finish, so the same card tapped inside before the door is shut is
+  # acknowledged instead of starting an MFA that would time out into a major
+  # alarm - which is what an elevated-mode arrival did, every time somebody
+  # tapped in "to be sure".
+  #
+  # And presence. The usual elevated arrival is doorbell scan (reconcile sets
+  # Away - the card is outside), door opened, challenge answered with the PIN at
+  # the keypad. Nothing then ever set the card At home: Complete Authorized
+  # Passage needs a passage window, and the MFA branch cancels those. So the
+  # person who just authenticated their way in read Away for the rest of the
+  # night, house_empty could come out true with them asleep upstairs, and the
+  # Frigate "person detected while away" push fired on them. An opening the
+  # IMU called "inside" is someone in the house who opened the door - they may
+  # be going out - so presence is left alone for that one. Visitors are never
+  # occupants. Guarded and option-checked like guardian_reconcile_presence:
+  # this script is called blocking from process_rfid_scan and the PIN handler.
+  - if:
+    - condition: template
+      value_template: >-
+        {{ (slot | default('', true) | string | trim) in
+           ((states('sensor.guardian_rfid_slots') | string).split(',')
+            | map('trim') | reject('eq', '') | list) }}
+    then:
+    - action: input_text.set_value
+      continue_on_error: true
+      target:
+        entity_id: input_text.guardian_last_entry
+      data:
+        value: "{{ slot | string | trim }}|{{ as_timestamp(now()) | int(0) }}"
+    - variables:
+        cleared_slot: "{{ slot | string | trim }}"
+    - if:
+      - condition: template
+        value_template: >-
+          {{ origin != 'inside'
+             and (states('input_select.rfid_' ~ cleared_slot ~ '_policy') | string | trim) != 'visitor'
+             and states('input_select.rfid_' ~ cleared_slot) == 'Away'
+             and 'At home' in (state_attr('input_select.rfid_' ~ cleared_slot, 'options')
+                               | default([], true) | list) }}
+      then:
+      - action: input_select.select_option
+        continue_on_error: true
+        target:
+          entity_id: input_select.rfid_{{ cleared_slot }}
+        data:
+          option: At home
   # Informational, not high priority. An answered challenge is the system working
   # as designed; only an unanswered one is an alarm. Card answers go to that
   # person; PIN answers have no slot and broadcast.
