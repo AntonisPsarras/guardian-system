@@ -6199,6 +6199,141 @@ the Lamp, Activity and Internals views changed.
      restart, then flash the portal, then the doorbell. *Needs the Pi; not
      done.*
 
+## Forty-ninth pass — the doorbell that stopped reading through its cover
+
+**What the house saw.** The doorbell reads a card with its top cover off and
+not with it fitted. It used to read through the cover. The suspicion was that
+the seventeenth pass cut the range by leaving the receiver gain at the
+MFRC522's reset value. Firmware only; version stays **2.33.0**. Finding F-73 in
+`GUARDIAN_AUDIT.md` §8.9. The firmware was **not compiled** (no ESPHome
+toolchain on the machine this was written on).
+
+### What the history says
+
+Every RF front-end write, traced through `archive/pre-public` and checked
+against stock ESPHome `rc522`:
+
+| Setting | History |
+|---|---|
+| RFCfgReg (RxGain) | Stock never wrote it: **33 dB**. The fifteenth/sixteenth-pass `guardian_rfid` wrote `0x70` (48 dB). The **seventeenth pass removed that write**: 33 dB ever since. |
+| RxModeReg / RxSelReg | `0x00` / reset `0x84` → `0x08` (RxNoErr) / `0x88` (RxWait ≈ 75 µs), seventeenth pass. Unchanged since. |
+| IRQ sampling | Immediate → ≥ 2 ms after StartSend, empty FIFO keeps listening. Seventeenth pass. |
+| Field-on delay | 1 ms → 5 ms (sixteenth) → 10 ms (seventeenth). Field off at the end of every poll, as stock did. |
+| REQA → WUPA; CRC_A on SAK; CollErr rejected | Commits `e161399` (2026-08-24) and `c56288e` (08-28). The last change to the RF path. |
+| CWGsPReg / ModGsPReg / TxASK / timer | Never changed by any build, stock included. |
+| Poll interval | Doorbell 1 s (stock) → 250 ms; portal 500 ms throughout. |
+
+**The suspicion is half right.** The seventeenth pass did drop the 48 dB, so
+the doorbell has had 15 dB of receive gain it was not using. But that cannot
+be what changed a few weeks ago: the only 48 dB firmware failed SELECT on every
+tap (seventeenth pass, above), stock ran at 33 dB, and the RF setup has been
+byte-identical since 2026-08-22. The 08-28 frame checks reject frames the chip
+itself flags as corrupt; they may shave the very edge of the field and they
+stay, because accepting those frames is what produced the wrong-card verdicts.
+A doorbell flashed from this tree after August lost its cover range to
+something physical — which is why this pass ends in a checklist.
+
+The 48 dB was blamed for "TX ringing looking like a frame" at a time when
+RxNoErr was off and there was no RxWait. The same pass fixed both, and those
+fixes — not the gain — are what keep ringing out of the FIFO. They are
+untouched here.
+
+### What changed
+
+- `guardian_rfid` takes **`rx_gain`** per reader. It is applied in
+  `pcd_init_()`, so after the soft reset at boot. On a reader whose settings
+  differ from the chip's reset values, every poll reads it back; a value that
+  has gone back means the PCD reset under the ESP (a supply sag), and the
+  whole of `pcd_init_()` runs again, because that reset also took RxSel, TxASK
+  and the timer. The portal, at reset values, does no extra I2C.
+- **`cw_conductance`** (CWGsPReg, antenna driver strength) exists and is set on
+  neither reader. It is never written unless configured.
+- **Boot:** `RFID front end source=doorbell rx_gain=48 dB (RFCfgReg=0x78)
+  cw_conductance=0x20 (chip default)` at INFO, read back from the chip. That
+  line only reaches USB serial; the **config dump**, printed whenever logs are
+  attached over Wi-Fi, carries `RX gain: 48 dB (RFCfgReg 0x78, configured 48
+  dB)` and the totals below. ERROR `did not stick` if the chip ignored the
+  write.
+- **Range is visible without DEBUG.** The existing `PICC present but select
+  failed` WARN now ends `total=N of M WUPA answers since boot`, a read that
+  needed retries logs `RFID select succeeded after N failed attempt(s)`, and
+  the config dump says `Since boot: M WUPA answers, N of them failed SELECT`.
+
+Crypto, the payload, the rolling counter and every Home Assistant decision are
+unchanged.
+
+### New options
+
+| Option | Values | Default | Doorbell | Portal |
+|---|---|---|---|---|
+| `rx_gain` | `18dB` `23dB` `33dB` `38dB` `43dB` `48dB` | `33dB` (chip reset) | `48dB` | `33dB` |
+| `cw_conductance` | `0`–`63` | not written (chip reset `0x20`) | — | — |
+
+### Deploy class
+
+**Reflash the doorbell. Home Assistant does not change** — no copy, no restart.
+Copy `esphome/components/guardian_rfid/` and both device YAMLs first.
+Reflashing the portal is recommended so both readers run the same component
+(its RF settings are the ones it already had), not required.
+
+### Verify
+
+351. **The doorbell is at 48 dB.** After the flash, open the doorbell's logs in
+     ESPHome. The config dump reads `RX gain: 48 dB (RFCfgReg 0x78, configured
+     48 dB)`; no `did not stick` ERROR. On USB serial the boot line reads
+     `RFID front end source=doorbell rx_gain=48 dB`. *Needs the doorbell.*
+352. **It reads through the assembled cover.** Cover fitted and screwed down,
+     present a card at the normal distance, ten times. Ten `RFID scan
+     (doorbell): result=ok` lines (or `enrolled` in enrollment) and no
+     `select failed` WARNs between them. Then a key fob the same way.
+     *Needs the doorbell and a card.*
+353. **Idle is still quiet at 48 dB.** No card near the doorbell for five
+     minutes at INFO: no `PICC present but select failed`, no `read_fail`
+     scan. If those appear with nothing on the coil, set `rx_gain: 43dB` and
+     reflash. Optional, at DEBUG: idle polls are `RFID xfer cmd=0x26
+     timeout(timer) irq=0x45` or quiet `RFID WUPA ... status=1`, not floods of
+     `empty fifo` or `error err=`; set INFO back afterwards. *Not done.*
+354. **Read the edge correctly.** Move a card slowly away from the cover.
+     `select failed ... total=N of M` and `select succeeded after N failed
+     attempt(s)` mean the card is powered but its answer is weak — gain
+     territory. If the card goes straight from reading to silence, with no
+     `select failed` lines in between, it never answered WUPA: it is not
+     being powered. Work through the checklist below before trying
+     `cw_conductance: 63`, which draws more current from the doorbell's
+     3.3 V rail. *Not done.*
+355. **The portal still reads.** Flash the portal. Its config dump reads
+     `RX gain: 33 dB (RFCfgReg 0x48, configured 33 dB)`; a tap gives
+     `RFID scan (interior portal): result=ok` and GRANTED, as before.
+     *Needs the door.*
+356. **Preflight.** `python tools/guardian-preflight.py` reports all literals
+     at **2.33.0** and passes. `python tools/guardian-selftest-preflight.py`
+     ends **`37 of 37 faults caught.`**
+
+### If gain does not fix it
+
+13.56 MHz passes through plastic; what the cover changes is **distance and
+what sits around the coil**. An RC522 board reads a card at a few centimetres
+and a key fob at noticeably less, so millimetres matter.
+
+- **Coil to cover face.** Measure from the antenna PCB to the outside of the
+  cover where the card is held. The coil should sit flat against the inside
+  of the cover with no air gap; a board that has slipped back in its slot, or
+  a cover that no longer seats fully, costs range.
+- **Cover thickness over the antenna.** A reprint with a different profile, a
+  thicker wall, more top layers, or a faceplate or sticker added over the tap
+  area all push the card out.
+- **Metal near the coil.** Screws, threaded inserts, a metal backplate, the
+  door frame or a foil-backed tape within about a centimetre of the antenna
+  detune it and soak up the field. Move them, use nylon screws, or put a
+  ferrite sheet behind the coil if it must mount on metal.
+- **Antenna and power wiring.** Reseat or reflow any antenna lead and the
+  module's header. Measure 3.3 V at the RC522 while a card is presented; a
+  sagging supply is a weaker field.
+- **Enclosure orientation.** The coil plane should be parallel to the cover
+  face and the card, and the tap mark on the cover centred over the coil.
+  Check the module did not go back in rotated or offset after the cover came
+  off.
+
 ## Still outstanding
 
 *Found in the forty-third pass and deliberately not fixed. Each says why, so the

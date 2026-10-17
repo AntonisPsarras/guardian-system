@@ -3167,3 +3167,29 @@ Opening Supervisor, Entry Challenge Timeout, MFA Timeout and Door Left Open all
 require elevated mode; Unscanned Key Entry and Uncertain Door Direction never
 alarm; the offline siren's stale-belief bound is unchanged and documented.
 
+### 8.9 Forty-ninth pass (doorbell read range through its cover)
+
+A live report: the doorbell reads with its cover off, not with it fitted, and
+used to. Firmware only, version **2.33.0**, not compiled. Live checks are
+`DEPLOY.md` forty-ninth-pass items 351–356.
+
+#### F-73 — The doorbell ran at the PCD's reset receiver gain — **HARDENING**
+
+The seventeenth pass (§22) removed the `RFCfgReg = 0x70` (48 dB) write together
+with the phantom-RxIRq fixes, crediting it with "TX ringing looking like a
+frame". RxNoErr and RxWait are what gate ringing, and both stay. Both readers
+have run at 33 dB since, as stock `rc522` always did.
+
+**Not the cause of the regression.** No firmware that ever read a card ran at
+48 dB: the only one that did failed SELECT on every tap. The RF register setup
+is unchanged since 2026-08-22, and the last RF-path change (CRC_A on SAK,
+CollErr rejected) is 2026-08-28. A loss of cover range after that is physical.
+
+**Hardened:** `rx_gain` per reader (default 33 dB, the reset value; doorbell
+48 dB), applied in `pcd_init_()` with RFCfgReg's reserved bits kept, re-checked
+each poll where it differs from reset (a mismatch re-runs `pcd_init_()`, since
+a PCD reset also lost RxSel, TxASK and the timer), read back at boot and in the
+config dump. `cw_conductance` (CWGsPReg) exists, unset on both. Since-boot WUPA
+answers and SELECT failures are logged at WARN/INFO so a range problem shows
+without DEBUG.
+
