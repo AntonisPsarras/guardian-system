@@ -649,6 +649,10 @@ guardian_rfid:
   address: 0x28
   update_interval: 500ms
   source: interior_portal
+  # The chip's reset value, which every build of this reader that ever read a
+  # card has run at. Stated so the difference from the doorbell (48dB, reads
+  # through its cover) is visible.
+  rx_gain: 33dB
   master_key: !secret guardian_rfid_mac_key
   enrollment: ha_enrollment_mode
   on_write_begin:

@@ -217,6 +217,13 @@ guardian_rfid:
   address: 0x28
   update_interval: 250ms
   source: doorbell
+  # The MFRC522's maximum receiver gain. This reader has to read through its
+  # assembled cover; it ran at the chip's reset 33 dB from the seventeenth pass
+  # on, like the portal still does. If an idle doorbell (no card) starts logging
+  # "PICC present but select failed", step down to 43dB. If a card at the cover
+  # never answers at all, the next lever is cw_conductance - see DEPLOY.md
+  # forty-ninth pass before reaching for it.
+  rx_gain: 48dB
   master_key: !secret guardian_rfid_mac_key
   enrollment: ha_enrollment_mode
   on_scan:

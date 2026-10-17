@@ -34,6 +34,8 @@ static const uint8_t REG_RX_SEL = 0x17;
 static const uint8_t REG_CRC_H = 0x21;
 static const uint8_t REG_CRC_L = 0x22;
 static const uint8_t REG_MOD_WIDTH = 0x24;
+static const uint8_t REG_RF_CFG = 0x26;
+static const uint8_t REG_CW_GSP = 0x28;
 static const uint8_t REG_T_MODE = 0x2A;
 static const uint8_t REG_T_PRESCALER = 0x2B;
 static const uint8_t REG_T_RELOAD_H = 0x2C;
@@ -85,6 +87,13 @@ static const uint8_t SELECT_FAIL_REPORT_AT = 6;
 // after a real lift before a retap is a new presentation.
 static const uint8_t PRESENCE_DROP_MISSES = 2;
 static const uint8_t PUBLISHED_DROP_MISSES = 4;
+// RFCfgReg: RxGain is bits 6:4, bits 3:0 are reserved and keep their reset
+// value. Reset is 0x48, i.e. RxGain 100 = 33 dB. CWGsPReg resets to 0x20.
+static const uint8_t RF_CFG_GAIN_MASK = 0x70;
+static const uint8_t RX_GAIN_RESET = 4;
+static const uint8_t CW_GSP_MASK = 0x3F;
+static const uint8_t CW_GSP_RESET = 0x20;
+static const uint8_t RX_GAIN_DB[8] = {18, 23, 18, 23, 33, 38, 43, 48};
 
 static bool picc_ack_ok(const uint8_t *recv, uint8_t recv_len) {
   if (recv_len >= 1 && ((recv[0] & 0x0A) == 0x0A || (recv[0] & 0xA0) == 0xA0))
@@ -152,7 +161,25 @@ void GuardianRfid::setup() {
   if (ver == 0x00 || ver == 0xFF) {
     ESP_LOGE(TAG, "MFRC522 not responding on I2C");
     this->mark_failed();
+    return;
   }
+  // Read back, not echo the config: a range complaint starts with what the PCD
+  // is actually running at. Only reaches USB serial at boot; dump_config below
+  // repeats it whenever logs are attached over Wi-Fi.
+  uint8_t rf = this->pcd_read_(REG_RF_CFG);
+  uint8_t cw = this->pcd_read_(REG_CW_GSP);
+  ESP_LOGI(TAG, "RFID front end source=%s rx_gain=%u dB (RFCfgReg=0x%02X) cw_conductance=0x%02X (%s)",
+           this->source_.c_str(), (unsigned) RX_GAIN_DB[(rf & RF_CFG_GAIN_MASK) >> 4], rf, cw,
+           this->has_cw_conductance_ ? "set" : "chip default");
+  if (!this->rf_config_ok_()) {
+    ESP_LOGE(TAG, "RFID rx_gain %u dB / cw_conductance did not stick (RFCfgReg=0x%02X CWGsPReg=0x%02X)",
+             (unsigned) RX_GAIN_DB[this->rx_gain_], rf, cw);
+    return;
+  }
+  // At the reset values a PCD reset is invisible and costs nothing, so the
+  // portal (33 dB, CWGsP untouched) does no extra I2C on its shared IMU bus.
+  this->rf_check_ =
+      this->rx_gain_ != RX_GAIN_RESET || (this->has_cw_conductance_ && this->cw_conductance_ != CW_GSP_RESET);
 }
 
 void GuardianRfid::dump_config() {
@@ -160,6 +187,15 @@ void GuardianRfid::dump_config() {
   ESP_LOGCONFIG(TAG, "  Source: %s", this->source_.c_str());
   LOG_I2C_DEVICE(this);
   LOG_UPDATE_INTERVAL(this);
+  if (this->is_failed())
+    return;
+  uint8_t rf = this->pcd_read_(REG_RF_CFG);
+  ESP_LOGCONFIG(TAG, "  RX gain: %u dB (RFCfgReg 0x%02X, configured %u dB)",
+                (unsigned) RX_GAIN_DB[(rf & RF_CFG_GAIN_MASK) >> 4], rf, (unsigned) RX_GAIN_DB[this->rx_gain_]);
+  ESP_LOGCONFIG(TAG, "  CW conductance: 0x%02X (%s)", this->pcd_read_(REG_CW_GSP),
+                this->has_cw_conductance_ ? "set" : "chip default");
+  ESP_LOGCONFIG(TAG, "  Since boot: %u WUPA answers, %u of them failed SELECT", (unsigned) this->wupa_answers_,
+                (unsigned) this->select_fails_since_boot_);
 }
 
 void GuardianRfid::pcd_write_(uint8_t reg, uint8_t value) { this->write_byte(reg, value); }
@@ -219,8 +255,34 @@ void GuardianRfid::pcd_init_() {
   this->pcd_write_(REG_T_RELOAD_L, 0xE8);
   this->pcd_write_(REG_TX_ASK, 0x40);
   this->pcd_write_(REG_MODE, 0x3D);
-  // Leave RFCfgReg at reset 33 dB. Forcing 48 dB made TX ringing look like a frame.
+  // Receiver gain is per reader now (rx_gain). The seventeenth pass left it at
+  // the reset 33 dB because forcing 48 dB "made TX ringing look like a frame",
+  // but that was with RxNoErr off and no RxWait. RxSelReg 0x88 and RxModeReg
+  // 0x08 above are what keep ringing out of the FIFO now; DEPLOY.md
+  // forty-ninth pass step 353 checks an idle doorbell stays quiet at 48 dB.
+  this->pcd_apply_rf_();
   this->pcd_antenna_off_();
+}
+
+void GuardianRfid::pcd_apply_rf_() {
+  uint8_t rf = this->pcd_read_(REG_RF_CFG);
+  uint8_t want = (uint8_t) ((rf & ~RF_CFG_GAIN_MASK) | (this->rx_gain_ << 4));
+  if (rf != want)
+    this->pcd_write_(REG_RF_CFG, want);
+  if (this->has_cw_conductance_) {
+    uint8_t cw = this->pcd_read_(REG_CW_GSP);
+    uint8_t want_cw = (uint8_t) ((cw & ~CW_GSP_MASK) | this->cw_conductance_);
+    if (cw != want_cw)
+      this->pcd_write_(REG_CW_GSP, want_cw);
+  }
+}
+
+bool GuardianRfid::rf_config_ok_() {
+  if (((this->pcd_read_(REG_RF_CFG) & RF_CFG_GAIN_MASK) >> 4) != this->rx_gain_)
+    return false;
+  if (this->has_cw_conductance_ && (this->pcd_read_(REG_CW_GSP) & CW_GSP_MASK) != this->cw_conductance_)
+    return false;
+  return true;
 }
 
 bool GuardianRfid::pcd_crc_(const uint8_t *data, uint8_t len, uint8_t *out2) {
@@ -1679,6 +1741,14 @@ void GuardianRfid::update() {
   this->pcd_write_(REG_TX_MODE, 0x00);
   this->pcd_write_(REG_RX_MODE, 0x08);  // keep RxNoErr; 0x00 would undo pcd_init_()
   this->pcd_write_(REG_MOD_WIDTH, 0x26);
+  // Nothing else in this driver writes RFCfgReg/CWGsPReg, so a value that has
+  // gone back is the PCD resetting under us (a sag on its supply). That reset
+  // also took RxSelReg, TxASKReg and the timer, so re-run all of pcd_init_
+  // rather than putting back the gain alone.
+  if (this->rf_check_ && !this->rf_config_ok_()) {
+    ESP_LOGW(TAG, "RFID PCD lost its RF configuration source=%s, re-initialising", this->source_.c_str());
+    this->pcd_init_();
+  }
 
   this->pcd_antenna_on_();
   // ISO 14443: unmodulated field >= 10 ms after PICC power-up before WUPA.
@@ -1724,15 +1794,23 @@ void GuardianRfid::update() {
   }
 
   this->presence_misses_ = 0;
+  this->wupa_answers_++;
 
   uint8_t sak = 0;
   st = this->picc_select_(&sak);
   if (st != ST_OK || this->uid_len_ == 0) {
     if (this->select_fails_ < 0xFF)
       this->select_fails_++;
-    ESP_LOGW(TAG, "RFID PICC present but select failed source=%s status=%s uid_bytes=%u fails=%u",
+    this->select_fails_since_boot_++;
+    // A card that answers WUPA and then cannot be selected is the signature of
+    // a weak link: enough field to power it, not enough signal back. The
+    // since-boot total makes a range problem visible without DEBUG.
+    ESP_LOGW(TAG,
+             "RFID PICC present but select failed source=%s status=%s uid_bytes=%u fails=%u total=%u of %u WUPA "
+             "answers since boot",
              this->source_.c_str(), this->status_name_(st), (unsigned) this->uid_len_,
-             (unsigned) this->select_fails_);
+             (unsigned) this->select_fails_, (unsigned) this->select_fails_since_boot_,
+             (unsigned) this->wupa_answers_);
     // A tag that answers WUPA but never yields a CRC-clean SELECT is one this
     // driver cannot identify. Say so once, then stay quiet until it leaves the
     // field, rather than retrying forever with nothing on the display.
@@ -1744,6 +1822,11 @@ void GuardianRfid::update() {
     this->pcd_stop_crypto1_();
     this->pcd_antenna_off_();
     return;
+  }
+  // A read that only worked after retries is a card at the edge of the field.
+  if (this->select_fails_ > 0) {
+    ESP_LOGI(TAG, "RFID select succeeded after %u failed attempt(s) source=%s", (unsigned) this->select_fails_,
+             this->source_.c_str());
   }
   this->select_fails_ = 0;
 

@@ -70,6 +70,13 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   void set_master_key_hex(const std::string &hex);
   void set_enrollment_sensor(binary_sensor::BinarySensor *sens) { this->enrollment_ = sens; }
   void set_allow_transport_key(bool allow) { this->allow_transport_key_ = allow; }
+  // RFCfgReg RxGain code (bits 6:4 value, 0-7). See __init__.py.
+  void set_rx_gain(uint8_t code) { this->rx_gain_ = (uint8_t) (code & 0x07); }
+  // CWGsPReg conductance (0-63). Left at the chip's reset value unless set.
+  void set_cw_conductance(uint8_t value) {
+    this->cw_conductance_ = (uint8_t) (value & 0x3F);
+    this->has_cw_conductance_ = true;
+  }
 
   void add_on_scan_callback(std::function<void()> &&f) { this->scan_callbacks_.push_back(std::move(f)); }
   void add_on_write_begin_callback(std::function<void()> &&f) {
@@ -113,6 +120,11 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   void pcd_antenna_off_();
   void pcd_soft_reset_();
   void pcd_init_();
+  // Write the configured receiver gain (and CWGsP when set) without touching
+  // RFCfgReg's reserved bits. Part of pcd_init_, so it follows every reset.
+  void pcd_apply_rf_();
+  // True when the PCD still holds the RF configuration pcd_apply_rf_ wrote.
+  bool rf_config_ok_();
   void pcd_stop_crypto1_();
   bool pcd_crc_(const uint8_t *data, uint8_t len, uint8_t *out2);
   // RxCRCEn is off in RxModeReg (see pcd_init_), so the PCD does not check
@@ -204,6 +216,14 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   // default because refusing it makes factory-blank Classic enrollment
   // impossible and strands every card not yet upgraded. See __init__.py.
   bool allow_transport_key_{true};
+  // 4 = 33 dB, the chip's reset value.
+  uint8_t rx_gain_{4};
+  uint8_t cw_conductance_{0};
+  bool has_cw_conductance_{false};
+  // Set in setup() only when the configuration differs from the chip's reset
+  // values AND it read back correctly at boot. Then a mismatch on a later poll
+  // can only mean the PCD reset under us, and update() re-runs pcd_init_.
+  bool rf_check_{false};
   binary_sensor::BinarySensor *enrollment_{nullptr};
 
   std::vector<std::function<void()>> scan_callbacks_;
@@ -246,6 +266,10 @@ class GuardianRfid : public PollingComponent, public i2c::I2CDevice {
   bool link_error_{false};
   uint8_t transient_retries_{0};
   uint8_t select_fails_{0};
+  // Range diagnostics only, since boot: polls where a PICC answered WUPA, and
+  // how many of those then failed SELECT. Not the card's rolling counter.
+  uint32_t wupa_answers_{0};
+  uint32_t select_fails_since_boot_{0};
 
   std::string result_;
   std::string card_id_hex_;
