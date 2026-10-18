@@ -7,6 +7,8 @@ warranty**. Read [README.md](README.md) § Security model and
 ## Reporting a problem
 
 Open a GitHub issue if the report contains **no** live credential.
+Use the **Problem** or **I built this** form
+(`.github/ISSUE_TEMPLATE/`). The form asks you to confirm that.
 
 Do **not** put any of the following in an issue, pull request, or
 screenshot:

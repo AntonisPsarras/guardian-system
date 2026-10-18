@@ -20,7 +20,8 @@ go into `/config`, plus firmware for two ESP32 boards.
   alarm if the network is down.** Cutting power to the portal still silences it:
   offline authority is RAM-only.
 - **KiCad is in the tree; Gerber+drill zips are too.** Print files are the
-  three `.3mf` profiles on MakerWorld / Printables. Send
+  three `.3mf` profiles plus generic STL zips on MakerWorld /
+  Printables / Thingiverse. Send
   `PCBs/*/…-Gerbers.zip` to a proto fab. There is no pick-and-place / CPL
   file: these are through-hole boards you populate by hand. The lamp has no
   PCB (commercial bulb + camera). See §1.

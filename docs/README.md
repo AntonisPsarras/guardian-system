@@ -9,7 +9,7 @@ the Home Assistant copy live in [`INSTALL.md`](../INSTALL.md).
 | [`bom.md`](bom.md) | One-page parts checklist (modules and passives). Not a pick-and-place file. |
 | [`sounds/README.md`](sounds/README.md) | DFPlayer track names. The MP3s are not in this tree. |
 | [`../PCBs/README.md`](../PCBs/README.md) | KiCad 10 projects and Gerber+drill zips for the two custom boards. |
-| [`../3D-Models/README.md`](../3D-Models/README.md) | Print files: three `.3mf` profiles on MakerWorld / Printables. This tree does not ship STLs. |
+| [`../3D-Models/README.md`](../3D-Models/README.md) | Print files: three `.3mf` profiles plus generic STL zips on MakerWorld / Printables / Thingiverse. This tree does not ship meshes. |
 
 | Device | Assembly | PDF | Print | PCB / Gerbers |
 |---|---|---|---|---|

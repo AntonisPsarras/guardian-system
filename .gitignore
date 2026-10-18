@@ -112,9 +112,13 @@ desktop.ini
 *.swp
 *~
 
-# Local launch notes — never publish
+# Local launch / GTM — never publish. Stays on disk for the maintainer.
 _launch_plan_extract.md
 *_launch_plan*.md
+docs/maintainers/LAUNCH.md
+docs/maintainers/launch-copy.md
+docs/maintainers/print-listings.md
+docs/maintainers/launch/
 
 # Editor / agent local state
 .cursor/

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Do not paste secrets
+    url: https://github.com/AntonisPsarras/guardian-system/blob/main/SECURITY.md
+    about: Wi-Fi, RTSP, card keys, PINs, and secrets.yaml dumps do not go in issues.
+  - name: Install path
+    url: https://github.com/AntonisPsarras/guardian-system/blob/main/INSTALL.md
+    about: Fresh Home Assistant to a working system.
