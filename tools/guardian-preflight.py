@@ -2709,6 +2709,65 @@ def check_startup_reachable_state(repo, rep):
                             "declares initial: %r" % (alias, ent, match.group(1),
                                                       src, init))
 
+        # THE SAME TRAP ONE HOP REMOVED, found in the forty-eighth pass.
+        # "Guardian: Lamp Sampling Watchdog" runs at homeassistant:start to put
+        # back a lamp that a restart interrupted mid-sample. It read the stash
+        # into a variable - stash: "{{ states('input_text.guardian_lamp_presample')
+        # | string | trim }}" - and only restored when
+        # "stash not in ['', 'none', ...]". The helper declared initial: none, so
+        # at start the stash was ALWAYS none and the restart recovery F-39 wrote
+        # had never run. Both tests above look for the helper inside the
+        # condition; neither could see it through a variable.
+        #
+        # So: a variable assigned from a bare states('<helper with initial:>')
+        # (filters allowed), then compared in a template of the same automation
+        # with `not in [...]` / `in [...]` / `!=` / `==` such that the initial
+        # value makes the comparison fail.
+        var_ent = {}
+
+        def assignments(node):
+            if isinstance(node, list):
+                for item in node:
+                    assignments(item)
+            elif isinstance(node, dict):
+                block = node.get("variables")
+                if isinstance(block, dict):
+                    for name, tpl in block.items():
+                        if not isinstance(name, str) or not isinstance(tpl, str):
+                            continue
+                        m = re.match(
+                            r"^\s*\{\{\s*states\(\s*'([a-z_]+\.[a-z0-9_]+)'\s*\)[^{}]*\}\}\s*$",
+                            tpl)
+                        if m and m.group(1) in initials:
+                            var_ent[name] = m.group(1)
+                for value in node.values():
+                    assignments(value)
+
+        assignments(body)
+        assignments({"variables": auto.get("variables")})
+
+        def quoted(listing):
+            return [a or b for a, b in re.findall(r"'([^']*)'|\"([^\"]*)\"", listing)]
+
+        for tpl in tpls:
+            for var, ent in var_ent.items():
+                init, src = initials[ent]
+                name = re.escape(var)
+                for m in re.finditer(r"\b%s\b\s+(not\s+)?in\s+\[([^\]]*)\]" % name, tpl):
+                    listed = init in quoted(m.group(2))
+                    if (m.group(1) and listed) or (not m.group(1) and not listed):
+                        dead.append(
+                            "%s\n            template: %s %sin [...] where %s = "
+                            "states('%s'), but %s declares initial: %r"
+                            % (alias, var, m.group(1) or "", var, ent, src, init))
+                for m in re.finditer(r"\b%s\b\s*(==|!=)\s*['\"]([^'\"]*)['\"]" % name, tpl):
+                    same = m.group(2) == init
+                    if (m.group(1) == "!=" and same) or (m.group(1) == "==" and not same):
+                        dead.append(
+                            "%s\n            template: %s %s %r where %s = states('%s'), "
+                            "but %s declares initial: %r"
+                            % (alias, var, m.group(1), m.group(2), var, ent, src, init))
+
     if dead:
         rep.fail(
             "a startup condition that can never be true",

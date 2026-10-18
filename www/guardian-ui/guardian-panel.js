@@ -58,10 +58,10 @@
  * nothing makes them arrive together, so "the panel is new" says nothing about
  * scripts.yaml or packages/. When these disagree the panel says so instead of
  * letting old logic answer new questions. */
-const GUARDIAN_UI_VERSION = '2.32.5';
+const GUARDIAN_UI_VERSION = '2.33.0';
 
 /* What configuration.yaml ASKED the browser to load, read back off this module's
- * own URL (`/local/guardian-ui/guardian-panel.js?v=2.32.5`).
+ * own URL (`/local/guardian-ui/guardian-panel.js?v=2.33.0`).
  *
  * THIS IS THE THIRD NUMBER, AND WITHOUT IT DIAGNOSTICS GIVES THE WRONG REMEDY.
  * Until now the panel knew two things: the version compiled into the file it is
@@ -284,6 +284,9 @@ const E = {
   mfaFails: 'input_number.mfa_failed_attempts',
   entryChallenge: 'input_boolean.guardian_entry_challenge',
   challengeOrigin: 'input_text.guardian_challenge_origin',
+  // Written by process_rfid_scan on every card scan; read-only here.
+  lastScan: 'input_text.guardian_last_scan',
+  lastEntry: 'input_text.guardian_last_entry',
   challengeSeconds: 'input_number.guardian_entry_challenge_seconds',
   challengeCardOk: 'input_boolean.guardian_challenge_card_ok',
   challengePinOk: 'input_boolean.guardian_challenge_pin_ok',
@@ -442,6 +445,10 @@ const ALIASES = {
  * stranded challenge or a lost passage window happens. Tap opens Home
  * Assistant's own more-info dialog, which is where an edit belongs. */
 const INTERNALS = [
+  /* First, because it is the row to read when a key "was refused": reader,
+   * slot, verdict, reported and stored counter, rotate and window. */
+  [E.lastScan, 'Last card scan'],
+  [E.lastEntry, 'Last completed entry'],
   [E.display, 'Portal display state'],
   [E.displaySeq, 'Display sequence'],
   [E.pendingEntry, 'Pending entry slots'],
@@ -2631,7 +2638,7 @@ function buildSecurity(hass, m) {
 const FAULT_COPY = {
   DOORBELL: ['Doorbell offline', 'The exterior reader and the doorbell button are not responding.'],
   CAMERA: ['Camera unavailable', 'The door camera is not reporting, so the lamp cannot be measured.'],
-  LUMA: ['Light measurement failed', 'The last ambient sample produced no usable reading.'],
+  LUMA: ['Light measurement is broken', 'Three ambient samples in a row produced no usable reading, so the lamp is running on sun elevation alone. One miss is routine and is not reported here.'],
   IMU: ['Portal IMU fault', 'The door motion sensor is unhealthy, so inside/outside direction is less reliable.'],
 };
 
@@ -2752,7 +2759,11 @@ function buildHealth(hass, camId) {
   const doorbellUp = isOn(hass, E.doorbellOnline);
   const camOk = camId && !isBlank(camId) && !dead(hass, camId);
   const imuProblem = st(hass, E.portalImuProblem) === 'on';
-  const lumaFailed = String(st(hass, E.lampResult, '')).includes('FAILED');
+  /* Mirrors the LUMA clause of sensor.guardian_faults rather than re-deriving
+   * one: three failed samples in a row. It used to be "the last verdict says
+   * FAILED", which made a single miss - or a lamp that was merely offline - a
+   * health fault. */
+  const lumaFailed = num(hass, E.lampFailStreak, 0) >= 3;
 
   return {
     portal: {
@@ -2800,10 +2811,24 @@ const LAMP_DECISION = {
 
 const LAMP_FAIL_WHY = {
   camera_unavailable: 'the camera entity was missing or unavailable',
+  interrupted: 'the sample did not finish within a minute and was stopped',
+  // Pre-2.33 verdict strings, still in history.
   lamp_unavailable: 'the lamp entity was missing or unavailable',
   already_running: 'a sample was already running, or the sampling flag was stuck on',
   alarm: 'the display is ALARM, so the sampler refused to take the lamp',
   feedback: 'a lamp feedback flash was in progress',
+};
+
+/* A HELD verdict is the sampler declining to measure, which is not a failure
+ * and must not look like one. The backend writes HELD for these since 2.33;
+ * "HELD alarm" predates that and used to parse as "Unparsed". */
+const LAMP_HELD_WHY = {
+  alarm: 'the alarm owns the lamp, so nothing was measured',
+  challenge: 'an authentication challenge holds the lamp amber',
+  feedback: 'a card feedback flash was in progress',
+  already_running: 'a sample was already running',
+  lamp_offline: 'the lamp is offline or unreachable, so there was nothing to switch — it is sampled again within a minute of coming back',
+  no_lamp: 'no lamp is configured',
 };
 
 function parseLampResult(raw) {
@@ -2814,8 +2839,17 @@ function parseLampResult(raw) {
   const sun = (s.match(/sun=(-?[\d.]+)/) || [])[1];
   const failed = /\bFAILED\b/.test(s);
   const failReason = (s.match(/\bFAILED\s+(\w+)/) || [])[1] || '';
+  const heldReason = (s.match(/\bHELD\s+(\w+)/) || [])[1] || '';
   const decision = (s.match(/\b(on_camera|off_camera|on_sun_override|off_sun_override|off_day_hold|on_sun|off_sun|hold|on_mismatch|off_mismatch)\b/) || [])[1] || '';
   const mode = (s.match(/\b(manual|learn|auto)\s*$/) || [])[1] || '';
+  if (heldReason && !failed) {
+    return {
+      at, luma, sun, failed: false, held: true, failReason: '', decision: '', mode,
+      verdict: 'Held',
+      why: LAMP_HELD_WHY[heldReason] || `the sampler held (${heldReason})`,
+      raw: s,
+    };
+  }
   const d = LAMP_DECISION[decision] || ['Unparsed', s];
   const verdict = failed ? 'Measurement failed' : d[0];
   const failWhy = LAMP_FAIL_WHY[failReason];
@@ -6549,7 +6583,11 @@ function viewLamp(m, hass, ui = {}) {
   const L = m.lamp;
   const out = [pageHead('Lamp')];
   const r = L.result;
-  const verdictTone = r ? (r.failed ? 'alarm' : r.decision.startsWith('on') ? 'warn' : 'idle') : 'idle';
+  /* One failed sample is routine; three in a row is the LUMA fault. The tone
+   * says which, instead of painting every miss in alarm red. */
+  const verdictTone = r
+    ? (r.failed ? (L.failStreak >= 3 ? 'alarm' : 'warn') : r.decision.startsWith('on') ? 'warn' : 'idle')
+    : 'idle';
 
   if (L.missing) {
     out.push(noteHtml('This panel has no lamp entity to talk to. Set <b>config.lamp</b> in the Guardian panel_custom block to your light. Lamp automation in the YAML still uses this house’s original entity until a later pass.',
@@ -7802,7 +7840,7 @@ function interpretHistory(hass, hist, m) {
     if (i === 0 || p.state === arr[i - 1].state || bad(p.state) || p.state === 'none') return;
     const r = parseLampResult(p.state);
     if (!r) return;
-    push(p.ts, r.failed ? 'alarm' : r.decision.startsWith('on') ? 'warn' : 'idle',
+    push(p.ts, r.failed ? 'warn' : r.decision.startsWith('on') ? 'warn' : 'idle',
       r.failed ? 'mdi:lightbulb-alert-outline' : 'mdi:lightbulb-outline',
       'lamp', r.verdict, `${r.why}${r.luma ? ` · luma ${r.luma}` : ''}${r.sun ? ` · sun ${r.sun}°` : ''}`);
   });
@@ -7847,19 +7885,27 @@ const LIVE_EVENTS = [
       ? `${d.name || `Key ${d.slot}`}. No passage window was opened.`
       : 'No passage window was opened.',
   })],
-  ['esphome.tamper_alert', (d) => ({
-    tone: 'alarm', icon: 'mdi:shield-alert-outline', cat: 'security',
-    title: d && d.reason === 'magnet_defeat'
-      ? 'Portal tamper: magnet defeat'
-      : d && d.reason === 'spoofed_contact'
-        ? 'Portal tamper: spoofed contact'
-        : 'Portal tamper',
-    sub: d && d.reason === 'magnet_defeat'
-      ? 'The door leaf rotated while the contact still read closed.'
-      : d && d.reason === 'spoofed_contact'
-        ? 'The door contact opened but the leaf never rotated.'
-        : (d && d.reason ? String(d.reason) : ''),
-  })],
+  /* Same split as "Guardian: Portal Tamper Alert": only strong evidence
+   * alarmed, so only strong evidence is drawn as an alarm here. A weak report
+   * (or one from firmware too old to label it) is a notice. */
+  ['esphome.tamper_alert', (d) => {
+    const strong = !!(d && d.reason === 'magnet_defeat' && String(d.evidence || '') === 'strong');
+    return {
+      tone: strong ? 'alarm' : 'warn',
+      icon: strong ? 'mdi:shield-alert-outline' : 'mdi:shield-outline',
+      cat: 'security',
+      title: strong
+        ? 'Portal tamper: magnet defeat'
+        : d && d.reason === 'spoofed_contact'
+          ? 'Door contact open, leaf never moved'
+          : 'Possible portal tamper',
+      sub: strong
+        ? 'The door leaf rotated while the contact still read closed. The alarm was raised.'
+        : d && d.reason === 'spoofed_contact'
+          ? 'Not alarmed. Usually a door left ajar or a knocked magnet.'
+          : 'Not alarmed. Reflash the portal if this says magnet defeat.',
+    };
+  }],
   ['guardian.door_opened_from_inside', () => ({
     tone: 'pass', icon: 'mdi:arrow-right-bold-box-outline', cat: 'door',
     title: 'Door opened from inside', sub: '',

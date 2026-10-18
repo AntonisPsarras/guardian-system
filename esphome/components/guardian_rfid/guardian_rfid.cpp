@@ -34,6 +34,8 @@ static const uint8_t REG_RX_SEL = 0x17;
 static const uint8_t REG_CRC_H = 0x21;
 static const uint8_t REG_CRC_L = 0x22;
 static const uint8_t REG_MOD_WIDTH = 0x24;
+static const uint8_t REG_RF_CFG = 0x26;
+static const uint8_t REG_CW_GSP = 0x28;
 static const uint8_t REG_T_MODE = 0x2A;
 static const uint8_t REG_T_PRESCALER = 0x2B;
 static const uint8_t REG_T_RELOAD_H = 0x2C;
@@ -85,6 +87,13 @@ static const uint8_t SELECT_FAIL_REPORT_AT = 6;
 // after a real lift before a retap is a new presentation.
 static const uint8_t PRESENCE_DROP_MISSES = 2;
 static const uint8_t PUBLISHED_DROP_MISSES = 4;
+// RFCfgReg: RxGain is bits 6:4, bits 3:0 are reserved and keep their reset
+// value. Reset is 0x48, i.e. RxGain 100 = 33 dB. CWGsPReg resets to 0x20.
+static const uint8_t RF_CFG_GAIN_MASK = 0x70;
+static const uint8_t RX_GAIN_RESET = 4;
+static const uint8_t CW_GSP_MASK = 0x3F;
+static const uint8_t CW_GSP_RESET = 0x20;
+static const uint8_t RX_GAIN_DB[8] = {18, 23, 18, 23, 33, 38, 43, 48};
 
 static bool picc_ack_ok(const uint8_t *recv, uint8_t recv_len) {
   if (recv_len >= 1 && ((recv[0] & 0x0A) == 0x0A || (recv[0] & 0xA0) == 0xA0))
@@ -152,7 +161,25 @@ void GuardianRfid::setup() {
   if (ver == 0x00 || ver == 0xFF) {
     ESP_LOGE(TAG, "MFRC522 not responding on I2C");
     this->mark_failed();
+    return;
   }
+  // Read back, not echo the config: a range complaint starts with what the PCD
+  // is actually running at. Only reaches USB serial at boot; dump_config below
+  // repeats it whenever logs are attached over Wi-Fi.
+  uint8_t rf = this->pcd_read_(REG_RF_CFG);
+  uint8_t cw = this->pcd_read_(REG_CW_GSP);
+  ESP_LOGI(TAG, "RFID front end source=%s rx_gain=%u dB (RFCfgReg=0x%02X) cw_conductance=0x%02X (%s)",
+           this->source_.c_str(), (unsigned) RX_GAIN_DB[(rf & RF_CFG_GAIN_MASK) >> 4], rf, cw,
+           this->has_cw_conductance_ ? "set" : "chip default");
+  if (!this->rf_config_ok_()) {
+    ESP_LOGE(TAG, "RFID rx_gain %u dB / cw_conductance did not stick (RFCfgReg=0x%02X CWGsPReg=0x%02X)",
+             (unsigned) RX_GAIN_DB[this->rx_gain_], rf, cw);
+    return;
+  }
+  // At the reset values a PCD reset is invisible and costs nothing, so the
+  // portal (33 dB, CWGsP untouched) does no extra I2C on its shared IMU bus.
+  this->rf_check_ =
+      this->rx_gain_ != RX_GAIN_RESET || (this->has_cw_conductance_ && this->cw_conductance_ != CW_GSP_RESET);
 }
 
 void GuardianRfid::dump_config() {
@@ -160,6 +187,15 @@ void GuardianRfid::dump_config() {
   ESP_LOGCONFIG(TAG, "  Source: %s", this->source_.c_str());
   LOG_I2C_DEVICE(this);
   LOG_UPDATE_INTERVAL(this);
+  if (this->is_failed())
+    return;
+  uint8_t rf = this->pcd_read_(REG_RF_CFG);
+  ESP_LOGCONFIG(TAG, "  RX gain: %u dB (RFCfgReg 0x%02X, configured %u dB)",
+                (unsigned) RX_GAIN_DB[(rf & RF_CFG_GAIN_MASK) >> 4], rf, (unsigned) RX_GAIN_DB[this->rx_gain_]);
+  ESP_LOGCONFIG(TAG, "  CW conductance: 0x%02X (%s)", this->pcd_read_(REG_CW_GSP),
+                this->has_cw_conductance_ ? "set" : "chip default");
+  ESP_LOGCONFIG(TAG, "  Since boot: %u WUPA answers, %u of them failed SELECT", (unsigned) this->wupa_answers_,
+                (unsigned) this->select_fails_since_boot_);
 }
 
 void GuardianRfid::pcd_write_(uint8_t reg, uint8_t value) { this->write_byte(reg, value); }
@@ -219,8 +255,34 @@ void GuardianRfid::pcd_init_() {
   this->pcd_write_(REG_T_RELOAD_L, 0xE8);
   this->pcd_write_(REG_TX_ASK, 0x40);
   this->pcd_write_(REG_MODE, 0x3D);
-  // Leave RFCfgReg at reset 33 dB. Forcing 48 dB made TX ringing look like a frame.
+  // Receiver gain is per reader now (rx_gain). The seventeenth pass left it at
+  // the reset 33 dB because forcing 48 dB "made TX ringing look like a frame",
+  // but that was with RxNoErr off and no RxWait. RxSelReg 0x88 and RxModeReg
+  // 0x08 above are what keep ringing out of the FIFO now; DEPLOY.md
+  // forty-ninth pass step 353 checks an idle doorbell stays quiet at 48 dB.
+  this->pcd_apply_rf_();
   this->pcd_antenna_off_();
+}
+
+void GuardianRfid::pcd_apply_rf_() {
+  uint8_t rf = this->pcd_read_(REG_RF_CFG);
+  uint8_t want = (uint8_t) ((rf & ~RF_CFG_GAIN_MASK) | (this->rx_gain_ << 4));
+  if (rf != want)
+    this->pcd_write_(REG_RF_CFG, want);
+  if (this->has_cw_conductance_) {
+    uint8_t cw = this->pcd_read_(REG_CW_GSP);
+    uint8_t want_cw = (uint8_t) ((cw & ~CW_GSP_MASK) | this->cw_conductance_);
+    if (cw != want_cw)
+      this->pcd_write_(REG_CW_GSP, want_cw);
+  }
+}
+
+bool GuardianRfid::rf_config_ok_() {
+  if (((this->pcd_read_(REG_RF_CFG) & RF_CFG_GAIN_MASK) >> 4) != this->rx_gain_)
+    return false;
+  if (this->has_cw_conductance_ && (this->pcd_read_(REG_CW_GSP) & CW_GSP_MASK) != this->cw_conductance_)
+    return false;
+  return true;
 }
 
 bool GuardianRfid::pcd_crc_(const uint8_t *data, uint8_t len, uint8_t *out2) {
@@ -1124,16 +1186,23 @@ bool GuardianRfid::protect_ntag_() {
   return this->ntag_write_(cfg0, cfg0b) == ST_OK;
 }
 
-bool GuardianRfid::authenticate_ntag_() {
+bool GuardianRfid::frame_error_(Status st) {
+  return st == ST_TIMEOUT || st == ST_CRC || st == ST_COLLISION || st == ST_ERROR;
+}
+
+bool GuardianRfid::authenticate_ntag_(Status *st) {
   uint8_t pwd[4], pack[2], got[2];
   bool derived = false;
+  // A failed derivation is not a link error and must not be retried as one.
+  *st = ST_UNSUPPORTED;
   this->derive_pwd_pack_(pwd, pack, &derived);
   if (!derived) {
     ESP_LOGW(TAG, "RFID NTAG auth failed: password derivation failed source=%s",
              this->source_.c_str());
     return false;
   }
-  if (this->ntag_pwd_auth_(pwd, got) != ST_OK)
+  *st = this->ntag_pwd_auth_(pwd, got);
+  if (*st != ST_OK)
     return false;
   // Constant-time, for the same reason as verify_mac_. PACK is only 16 bits and
   // a failure here yields no access, so the leak is worth little - but it costs
@@ -1292,6 +1361,74 @@ bool GuardianRfid::heal_torn_payload_(const uint8_t card_id[8], uint32_t counter
              (unsigned) this->retry_next_counter_);
     this->attempt_rotate_write_(card_id, this->retry_next_counter_, false);
     return true;
+  }
+  if (this->splice_recover_(card_id, counter, mac, &recovered)) {
+    ESP_LOGI(TAG, "RFID torn-write recovery via splice source=%s counter=%u -> %u", this->source_.c_str(),
+             (unsigned) counter, (unsigned) recovered);
+    this->attempt_rotate_write_(card_id, recovered, false);
+    return true;
+  }
+  return false;
+}
+
+// THE TEAR THE TWO CHECKS ABOVE CANNOT SEE, and the household's "my key stopped
+// working after I tapped it at the door and went in".
+//
+// A rotate rewrites the MAC a page (NTAG, 4 bytes) or a block (Classic: bytes
+// 12-15 in block 6, then the counter and bytes 0-11 in block 5) at a time. A
+// lift between two of those writes leaves neither the old MAC nor the new one
+// on the card but a SPLICE of the two, cut at a page boundary. counter-1 and
+// counter+1 above only ever compared whole MACs, so a splice failed both, and
+// the only thing that could heal it was the RAM stash on the reader that did
+// the writing - which is gone after that reader rotates any other card, after a
+// reboot, and was never there at all on the OTHER reader. A doorbell tap lifted
+// mid-write and then a tap at the interior portal was therefore bad_mac on
+// every later presentation: HOLD forever, until re-enrolled.
+//
+// Each half of a splice is a slice of an HMAC this card's key produced for this
+// card's uid and card_id, at two adjacent counters. Nobody without the master
+// key can produce the higher one, so a splice is evidence of a torn genuine
+// write, exactly like the whole-MAC cases above. A dump of the card at the lower
+// counter already verifies as-is and already rotates to the higher one, so this
+// lets a copy do nothing it could not do before.
+//
+// Both write orders are covered (MAC first then counter, which leaves the old
+// counter; and the pre-forty-sixth-pass counter first, which leaves the new
+// one), as are both halves on either side of every boundary, because which
+// half landed first depends on the medium. On a match the card is rewritten
+// consistently at the higher counter through the normal rotate path, which
+// verifies by read-back before it reports anything.
+bool GuardianRfid::splice_recover_(const uint8_t card_id[8], uint32_t counter, const uint8_t mac[16],
+                                   uint32_t *recovered) {
+  struct Pair {
+    uint32_t lo, hi;
+    bool ok;
+  };
+  const Pair pairs[2] = {
+      {counter, next_counter_(counter), true},
+      {counter - 1, counter, counter > 1},
+  };
+  static const uint8_t kSplits[3] = {4, 8, 12};
+  for (const Pair &pair : pairs) {
+    if (!pair.ok)
+      continue;
+    uint8_t lo_mac[16], hi_mac[16];
+    if (!this->compute_mac_(card_id, pair.lo, lo_mac) || !this->compute_mac_(card_id, pair.hi, hi_mac))
+      return false;
+    for (uint8_t split : kSplits) {
+      // Constant-time per candidate, like verify_mac_.
+      uint8_t diff_hi_first = 0, diff_lo_first = 0;
+      for (uint8_t i = 0; i < 16; i++) {
+        const uint8_t want_hi_first = i < split ? hi_mac[i] : lo_mac[i];
+        const uint8_t want_lo_first = i < split ? lo_mac[i] : hi_mac[i];
+        diff_hi_first |= (uint8_t) (want_hi_first ^ mac[i]);
+        diff_lo_first |= (uint8_t) (want_lo_first ^ mac[i]);
+      }
+      if (diff_hi_first == 0 || diff_lo_first == 0) {
+        *recovered = pair.hi;
+        return true;
+      }
+    }
   }
   return false;
 }
@@ -1484,6 +1621,12 @@ void GuardianRfid::handle_selected_(uint8_t sak) {
       // link problem, not a verdict about the card. Retry it silently.
       if (ast != ST_NAK && this->transient_("classic auth", ast))
         return;
+      // Still a link problem once the budget is spent - not "this card is not
+      // ours". It used to fall through to unsupported_tag.
+      if (ast != ST_NAK) {
+        this->give_up_link_("classic auth", ast);
+        return;
+      }
       ESP_LOGI(TAG, "RFID classic AUTH fail source=%s uid_bytes=%u", this->source_.c_str(),
                (unsigned) this->uid_len_);
       if (this->enrollment_on_()) {
@@ -1495,8 +1638,12 @@ void GuardianRfid::handle_selected_(uint8_t sak) {
     }
     uint8_t pages[9][4] = {};
     Status rst = this->read_payload_(pages);
-    if (rst != ST_OK && rst != ST_NAK && this->transient_("classic read", rst))
+    if (rst != ST_OK && rst != ST_NAK) {
+      if (this->transient_("classic read", rst))
+        return;
+      this->give_up_link_("classic read", rst);
       return;
+    }
     // Not a hardcoded `true`, which is what this used to pass. For a Classic
     // card "protected" means the sector opened with the DIVERSIFIED key, not
     // with the published transport key - a card still on FFFFFFFFFFFF is
@@ -1533,19 +1680,57 @@ void GuardianRfid::handle_selected_(uint8_t sak) {
   // Factory blanks read without PWD. PWD_AUTH first poisons some clones so the
   // following write never succeeds. Only AUTH after a NAK (AUTH0 already set).
   if (rst == ST_NAK) {
-    authed = this->authenticate_ntag_();
+    Status ast = ST_UNSUPPORTED;
+    authed = this->authenticate_ntag_(&ast);
     if (authed) {
       rst = this->read_payload_(pages);
+    } else if (frame_error_(ast)) {
+      // A GARBLED PWD_AUTH FRAME IS NOT A WRONG PASSWORD. Every key enrolled
+      // since the forty-third pass is password-protected, so every scan goes
+      // through this exchange - and one bad frame here left rst at NAK, no
+      // transient retry (NAK is excluded below), consume_payload_ with no
+      // payload, and "unsupported_tag": a registered key shown UNSUPPORTED and
+      // latched until it was lifted. Random, and indistinguishable from a
+      // foreign card. Retry it like any other link error.
+      if (this->transient_("ntag pwd_auth", ast))
+        return;
+      this->give_up_link_("ntag pwd_auth", ast);
+      return;
     } else {
       ESP_LOGI(TAG, "RFID PWD_AUTH fail source=%s uid_bytes=%u", this->source_.c_str(),
                (unsigned) this->uid_len_);
     }
   }
   // A garbled read must not be scored as bad_mac or blanked over during
-  // enrollment. Re-read it while the tag is still on the coil.
-  if (rst != ST_OK && rst != ST_NAK && this->transient_("ntag read", rst))
+  // enrollment. Re-read it while the tag is still on the coil - and once the
+  // retry budget is spent, report a read failure rather than a verdict about
+  // the card (it used to become bad_mac or unsupported_tag, and during
+  // enrollment a blank-and-rewrite of a card it had not managed to read).
+  if (rst != ST_OK && rst != ST_NAK) {
+    if (this->transient_("ntag read", rst))
+      return;
+    this->give_up_link_("ntag read", rst);
     return;
+  }
   this->consume_payload_(pages, rst == ST_OK, authed);
+}
+
+// The link failed repeatedly on a card that is still being presented. That is
+// a statement about the radio (a wet or cold antenna, a card held at the edge of
+// the field, a hurried tap), not about the card, so it must not be reported as
+// bad_mac or unsupported_tag - Home Assistant renders those as HOLD-with-
+// re-enroll advice and UNSUPPORTED respectively, and both stuck until the card
+// was lifted. "read_fail" carries no card_id and Home Assistant answers it with
+// a plain HOLD: lift it, tap again. During enrollment the existing silent
+// retry is kept instead, so a card that could not be read is never blanked.
+void GuardianRfid::give_up_link_(const char *what, Status st) {
+  ESP_LOGW(TAG, "RFID %s gave up after %u link errors status=%s source=%s", what,
+           (unsigned) (this->transient_retries_ + 1), this->status_name_(st), this->source_.c_str());
+  if (this->enrollment_on_()) {
+    this->defer_write_fail_();
+  } else {
+    this->fire_scan_("read_fail");
+  }
 }
 
 void GuardianRfid::update() {
@@ -1556,6 +1741,14 @@ void GuardianRfid::update() {
   this->pcd_write_(REG_TX_MODE, 0x00);
   this->pcd_write_(REG_RX_MODE, 0x08);  // keep RxNoErr; 0x00 would undo pcd_init_()
   this->pcd_write_(REG_MOD_WIDTH, 0x26);
+  // Nothing else in this driver writes RFCfgReg/CWGsPReg, so a value that has
+  // gone back is the PCD resetting under us (a sag on its supply). That reset
+  // also took RxSelReg, TxASKReg and the timer, so re-run all of pcd_init_
+  // rather than putting back the gain alone.
+  if (this->rf_check_ && !this->rf_config_ok_()) {
+    ESP_LOGW(TAG, "RFID PCD lost its RF configuration source=%s, re-initialising", this->source_.c_str());
+    this->pcd_init_();
+  }
 
   this->pcd_antenna_on_();
   // ISO 14443: unmodulated field >= 10 ms after PICC power-up before WUPA.
@@ -1601,23 +1794,39 @@ void GuardianRfid::update() {
   }
 
   this->presence_misses_ = 0;
+  this->wupa_answers_++;
 
   uint8_t sak = 0;
   st = this->picc_select_(&sak);
   if (st != ST_OK || this->uid_len_ == 0) {
     if (this->select_fails_ < 0xFF)
       this->select_fails_++;
-    ESP_LOGW(TAG, "RFID PICC present but select failed source=%s status=%s uid_bytes=%u fails=%u",
+    this->select_fails_since_boot_++;
+    // A card that answers WUPA and then cannot be selected is the signature of
+    // a weak link: enough field to power it, not enough signal back. The
+    // since-boot total makes a range problem visible without DEBUG.
+    ESP_LOGW(TAG,
+             "RFID PICC present but select failed source=%s status=%s uid_bytes=%u fails=%u total=%u of %u WUPA "
+             "answers since boot",
              this->source_.c_str(), this->status_name_(st), (unsigned) this->uid_len_,
-             (unsigned) this->select_fails_);
+             (unsigned) this->select_fails_, (unsigned) this->select_fails_since_boot_,
+             (unsigned) this->wupa_answers_);
     // A tag that answers WUPA but never yields a CRC-clean SELECT is one this
     // driver cannot identify. Say so once, then stay quiet until it leaves the
     // field, rather than retrying forever with nothing on the display.
+    // read_fail, not unsupported_tag: the tag never identified itself, so this
+    // says nothing about whether it is ours. A registered key held at the edge
+    // of the field was reported as a foreign card here.
     if (this->select_fails_ == SELECT_FAIL_REPORT_AT && !this->have_current_)
-      this->fire_scan_("unsupported_tag");
+      this->fire_scan_("read_fail");
     this->pcd_stop_crypto1_();
     this->pcd_antenna_off_();
     return;
+  }
+  // A read that only worked after retries is a card at the edge of the field.
+  if (this->select_fails_ > 0) {
+    ESP_LOGI(TAG, "RFID select succeeded after %u failed attempt(s) source=%s", (unsigned) this->select_fails_,
+             this->source_.c_str());
   }
   this->select_fails_ = 0;
 

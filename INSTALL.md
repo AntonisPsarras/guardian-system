@@ -11,7 +11,7 @@ for helpers that no longer exist. Come back to it when you upgrade.
 Guardian is not an add-on and not a HACS integration. It is a set of files that
 go into `/config`, plus firmware for two ESP32 boards.
 
-**Read this before you treat it as an alarm that will save you.** 2.32.5 is
+**Read this before you treat it as an alarm that will save you.** 2.33.0 is
 *ready with documented caveats*, not ready. The caveats are:
 
 - **The siren without Wi-Fi is written, compiled, unflashed and unheard.** Until
@@ -457,7 +457,7 @@ recorder:
 frontend:
   themes: !include_dir_merge_named themes
   extra_module_url:
-    - /local/guardian-ui/set-default-panel.js?v=2.32.5
+    - /local/guardian-ui/set-default-panel.js?v=2.33.0
 
 automation: !include automations.yaml
 script: !include scripts.yaml
@@ -468,7 +468,7 @@ panel_custom:
     sidebar_title: Guardian
     sidebar_icon: mdi:shield-home
     url_path: guardian
-    module_url: /local/guardian-ui/guardian-panel.js?v=2.32.5
+    module_url: /local/guardian-ui/guardian-panel.js?v=2.33.0
     require_admin: false
     config:
       camera: camera.door_camera
@@ -506,7 +506,7 @@ Merge the file contents, do not swap the files.
 Guardian ships as loose files that nothing forces to arrive together, and a
 half-copied install is the normal way this system breaks. Every half declares
 its version, and the panel compares them. In this release they all read
-**2.32.5**:
+**2.33.0**:
 
 `packages/guardian.yaml` · `packages/guardian_rfid.yaml` · `scripts.yaml`
 (the alias of `script.guardian_version_marker`) · `automations.yaml` (the alias
@@ -558,7 +558,7 @@ the entire fix.
 
 The `?v=` in `configuration.yaml` is what makes a browser fetch a new panel, and
 **it only works once per value.** If any browser requests
-`guardian-panel.js?v=2.32.5` while the file on disk is still the old one, Home
+`guardian-panel.js?v=2.33.0` while the file on disk is still the old one, Home
 Assistant serves old bytes under the new URL with a month-long `Cache-Control`,
 and that browser now has the wrong content cached against the *new* address. The
 cache buster has been spent on stale content, so nothing short of clearing the
@@ -582,7 +582,7 @@ Settings → Companion → *Reset frontend cache*.
 To confirm what your browser actually holds, open the module directly:
 
 ```
-http://<your-ha>:8123/local/guardian-ui/guardian-panel.js?v=2.32.5
+http://<your-ha>:8123/local/guardian-ui/guardian-panel.js?v=2.33.0
 ```
 
 and look at the `GUARDIAN_UI_VERSION` line near the top.
@@ -965,8 +965,8 @@ most of it comes from `DEPLOY.md`'s own verification steps.
 1. **Nothing is outstanding.** Run the setup wizard once more. The persistent
    notification says *Guardian is ready*.
 2. **Every file agrees.** Guardian → More → **Diagnostics** → Installation:
-   every row reads `2.32.5`, `automations.yaml` included — it reports a version
-   now, not `present`. The panel footer says `2.32.5` too. If it does not,
+   every row reads `2.33.0`, `automations.yaml` included — it reports a version
+   now, not `present`. The panel footer says `2.33.0` too. If it does not,
    your browser cached the old panel — the `?v=` in `configuration.yaml` is what
    busts that, so confirm you copied `configuration.yaml`.
 3. **The backend answers.** Diagnostics → Tests → **Backend self check** → Run.
@@ -1021,19 +1021,25 @@ again after any change to the alarm path.
     portal, the RFID reader and the door logic are all local and must be
     unaffected. **Push notifications will not arrive** — that is expected and is
     the subject of §10. Everything else working is the point of the test.
-15. **Magnet defeat is a tamper.** After the **portal** reflash, hold the reed
-    closed (a second magnet, or cheat the contact) and move the leaf or handle
-    so the swing integrator runs. Expected: portal ALARM, looping siren,
-    non-maskable push, reason *Portal tamper: magnet defeat*. A slam-shut must
-    **not** do this.
-16. **A spoofed contact is a tamper.** Open the reed without rotating the leaf
-    (lift the magnet, door still shut). After about 600 ms: ALARM, reason
-    *Portal tamper: spoofed contact*. If the IMU is unhealthy this path is
-    skipped on purpose.
+15. **Magnet defeat is a tamper.** After the **portal** reflash, wait a few
+    seconds with the door shut, then hold the reed closed (a second magnet, or
+    cheat the contact) and swing the **leaf** at least 15° without touching
+    the inside lever. Expected: portal ALARM, looping siren, non-maskable push,
+    reason *Portal tamper: magnet defeat*. Gripping or pressing the inside
+    lever with the door shut must **not** do this, and nor must a slam-shut or
+    a door pulled closed by its closer. (2.33 and later: the lever is the
+    inside of the door, and a magnet defeat is an attack from outside.)
+16. **A spoofed contact is a notice, not a siren.** Lift the magnet so the reed
+    reads open with the door still shut, and leave it. After about 8 seconds:
+    a persistent notification *Guardian: possible portal tamper (not
+    alarmed)* and an amber row in Activity — **no** ALARM. An unhealthy IMU
+    skips this on purpose. (Before 2.33 this sounded the siren after 600 ms,
+    which is what a gently opened door also looked like.)
 17. **A normal open is not a tamper.** Open from inside and from outside the
-    usual way. Neither must raise tamper. Then mute the other person's key to
-    Off (if you added a second account) and fire step 10 again: the house
-    alarm must still reach the linked phone.
+    usual way, briskly and with a gentle push, and let the door close on its
+    own. None of these may raise tamper or a notice. Then mute the other person's
+    key to Off (if you added a second account) and fire step 10 again: the
+    house alarm must still reach the linked phone.
 
 If step 1 keeps listing something you believe you have done, trust the wizard
 over the appearance of the panel. It asks the backend; the panel renders the

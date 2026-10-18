@@ -18,6 +18,8 @@ CONF_SOURCE = "source"
 CONF_MASTER_KEY = "master_key"
 CONF_ENROLLMENT = "enrollment"
 CONF_ALLOW_TRANSPORT_KEY = "allow_transport_key"
+CONF_RX_GAIN = "rx_gain"
+CONF_CW_CONDUCTANCE = "cw_conductance"
 CONF_ON_SCAN = "on_scan"
 CONF_ON_WRITE_BEGIN = "on_write_begin"
 CONF_ON_TAG_REMOVED = "on_tag_removed"
@@ -33,6 +35,18 @@ GuardianWriteBeginTrigger = guardian_rfid_ns.class_(
 GuardianTagRemovedTrigger = guardian_rfid_ns.class_(
     "GuardianTagRemovedTrigger", automation.Trigger.template()
 )
+
+
+# RFCfgReg RxGain codes (bits 6:4). 000/010 are both 18 dB and 001/011 both
+# 23 dB in the datasheet, so only one code per value is offered.
+RX_GAINS = {
+    "18db": 0,
+    "23db": 1,
+    "33db": 4,
+    "38db": 5,
+    "43db": 6,
+    "48db": 7,
+}
 
 
 HOWTO_MASTER_KEY = (
@@ -102,6 +116,28 @@ CONFIG_SCHEMA = (
             # the recommended medium: Crypto1 is broken, so an upgraded Classic
             # card is harder to clone, not safe from it.
             cv.Optional(CONF_ALLOW_TRANSPORT_KEY, default=True): cv.boolean,
+            # Receiver gain, per reader. The default is the MFRC522's own reset
+            # value, 33 dB, which is what both readers have run at since the
+            # seventeenth pass and what stock rc522 always ran at, so a YAML
+            # without this key behaves exactly as before.
+            #
+            # The seventeenth pass dropped a forced 48 dB because "TX ringing
+            # looked like a frame". That was diagnosed with RxNoErr off and no
+            # RxWait, and the same pass fixed both: RxSelReg now holds the
+            # receiver off for 8 bit-clocks after transmit and RxNoErr drops
+            # sub-4-bit bursts. The doorbell reads through its assembled cover
+            # and opts back in to the full 48 dB; the portal has no range
+            # complaint and keeps the reset value.
+            cv.Optional(CONF_RX_GAIN, default="33dB"): cv.enum(
+                RX_GAINS, lower=True, space=""
+            ),
+            # CWGsPReg, the antenna driver's conductance while the field is
+            # unmodulated (0-63, chip reset 32). Stronger field, more current
+            # from the 3.3 V rail. Never written unless set here, and no build
+            # of this reader or stock rc522 has ever changed it. This is the
+            # lever for a card that never answers WUPA at the cover distance;
+            # rx_gain is the lever for one that answers and then fails SELECT.
+            cv.Optional(CONF_CW_CONDUCTANCE): cv.int_range(min=0, max=63),
             cv.Optional(CONF_ON_SCAN): automation.validate_automation(
                 {
                     cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(GuardianScanTrigger),
@@ -135,6 +171,9 @@ async def to_code(config):
     cg.add(var.set_source(config[CONF_SOURCE]))
     cg.add(var.set_master_key_hex(config[CONF_MASTER_KEY]))
     cg.add(var.set_allow_transport_key(config[CONF_ALLOW_TRANSPORT_KEY]))
+    cg.add(var.set_rx_gain(RX_GAINS[config[CONF_RX_GAIN]]))
+    if CONF_CW_CONDUCTANCE in config:
+        cg.add(var.set_cw_conductance(config[CONF_CW_CONDUCTANCE]))
     if CONF_ENROLLMENT in config:
         sens = await cg.get_variable(config[CONF_ENROLLMENT])
         cg.add(var.set_enrollment_sensor(sens))

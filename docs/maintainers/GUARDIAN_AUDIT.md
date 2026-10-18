@@ -3007,3 +3007,189 @@ routing unchanged; critical alerts still `nonmaskable`. `require_admin`
 stays false. Direct helper writes from Developer Tools are still Home
 Assistant's model. Version **2.32.0**.
 
+### 8.8 Forty-eighth pass (LUMA at dusk, tamper on a gentle door, a key bricked by a hurried tap)
+
+Three live reports, each reconstructed to the line, then the rest of the
+security state machine audited for the same classes. Version **2.33.0**.
+Live checks are `DEPLOY.md` forty-eighth-pass items 333–350. Nothing below has
+run on hardware; the firmware half was not compiled.
+
+#### F-59 — An offline lamp was reported as a failed measurement — **BUG**
+
+`guardian_sample_ambient_light` wrote `FAILED lamp_unavailable hold`, bumped
+`guardian_lamp_fail_streak` and recreated `guardian_luminance_unusable` when the
+light was merely unavailable (Tapo cloud blip, bulb off at the wall) — every ten
+minutes at dusk, because a lamp that is off samples on the fast cadence.
+`already_running`, `challenge` and `feedback` holds also said FAILED, and
+`sensor.guardian_faults` raised LUMA on any `'FAILED' in` the last result, so a
+single transient was a fault. **Fixed:** holds are `HELD <why>` and touch
+neither the streak nor a notification; LUMA, the failure notification and the
+phone push all mean "three failed samples in a row" (the threshold the push
+already used). The panel parses HELD.
+
+#### F-60 — A cloud bulb raising mid-sample left the porch dark — **BUG, the reported night failure**
+
+No `light.*` call in the sampler, `guardian_restore_lamp` or
+`guardian_apply_lamp_sun_mismatch` carried `continue_on_error`. The first
+state-changing call of the evening is `light.turn_on` against a cloud bulb; a
+`HomeAssistantError` ended the run with the sampling flag on, and
+`Lamp Sampling Watchdog` restored the stash — `off` at dusk by construction —
+sixty seconds later ("restored to off"). The watchdog also restored underneath a
+run that was only slow, and could undo the sampler's own turn-on. **Fixed:**
+every lamp call guarded (the `none` sentinel already covered `vol.Invalid`); the
+watchdog stops the sampler first, lights the lamp when the sun is below −6°,
+restores the stash otherwise, and records `FAILED interrupted`. A returning bulb
+is sampled within ~30 s (`lamp_back` trigger). Sampler pushes are non-blocking.
+
+#### F-61 — The restart half of F-39 had never run — **BUG**
+
+`input_text.guardian_lamp_presample` declared `initial: none`, which is applied
+on every start and skips restore, so the watchdog's `homeassistant: start`
+branch (`stash not in ['', 'none', ...]`) was dead. The forty-fifth pass's
+startup-reachable check missed it because the helper was read through a
+variable. **Fixed:** no `initial:`; the check now follows
+`x: states('helper')` into `x not in / in / != / ==` tests, with a self-test
+injection.
+
+#### F-62 — The probe never received its IR argument — **BUG, minor**
+
+`shell_command.guardian_luma_write_run` passed mode, sun and rotate; the
+probe's `--write-run` reads a fourth, `ir`, so it always believed IR was
+unconfigured and applied the night-vision greyscale cap to frames taken with IR
+switched off. **Fixed:** `ir` mirrors the sampler's `ir_valid`. No change on a
+Frigate house.
+
+#### F-63 — Spoofed contact was a gently opened door — **BUG, the reported siren**
+
+`check_spoofed_reed` tested `|swing_angle| < 1.5°` 600 ms after the reed
+opened, but the integrator only counts rotation above `swing_rate_threshold`
+(8 °/s). A door eased open, pulled against its latch until the reed gap opened,
+or a bumped reed: "the leaf never rotated". **Fixed:** 8 s, reed still open, no
+swing sample from 1.6 s before the edge and the leaf never past 3°; reported
+`evidence: weak`.
+
+#### F-64 — Magnet defeat read the opening's leftovers and the inside lever — **BUG**
+
+The test ran from 1.0 s after a close against `swing_angle`, which keeps the
+whole opening until a 2 s reset; a door pulled shut by a slow closer never
+integrates back, so an ordinary close could read tens of degrees "with the reed
+closed". Lever cross-talk with the door shut also integrated (INSTALL told
+testers to "move the leaf or handle"). **Fixed:** a dedicated closed-door
+integrator, zero at every close and through the slam window, reset after 2 s of
+quiet, held at zero while the inside lever is in use; `evidence: strong`.
+
+#### F-65 — Magnet defeat was disarmed after every portal boot — **BUG, fail-open**
+
+`door_closed_ms` was 0 until the first close edge, and `closed_for` was 0 while
+it was. A power cut disarmed magnet defeat until somebody next opened the door.
+**Fixed:** seeded on the first physics tick with the door shut.
+
+#### F-66 — Every tamper event was the full alarm — **DESIGN, fail-noisy**
+
+`Guardian: Portal Tamper Alert` fired `guardian.major_alarm` for any
+`esphome.tamper_alert`, so the weakest physics in the firmware could sound the
+siren with Super Surveillance off. **Fixed:** only `magnet_defeat` with
+`evidence: strong` alarms (first step, unchanged); weak or unlabelled (older
+firmware) events are a persistent notice and an amber Activity row.
+
+#### F-67 — A MAC torn mid-rewrite could only be healed by the writing reader — **BUG, the reported refusal**
+
+A rotate rewrites the MAC a page (NTAG 9→12, then the counter) or a block
+(Classic 6, then 5) at a time. A lift between two of those writes leaves a
+boundary splice of MAC(n) and MAC(n+1). `heal_torn_payload_` compared only
+whole MACs at counter±1 and otherwise relied on the writing reader's RAM stash,
+which is cleared when that reader rotates any other card, lost on reboot, and
+absent on the other reader. Doorbell tap lifted mid-write, then interior tap:
+`bad_mac`, HOLD, permanently. **Fixed:** `splice_recover_` accepts a splice of
+two adjacent MACs for this card at any page/block boundary, either half first,
+for both write orders, then rewrites consistently through the verified rotate.
+Each half requires the card key; a copy gains nothing; `window_ok` unchanged.
+
+#### F-68 — Link errors were reported as verdicts about the card — **BUG, the "random" refusals**
+
+One garbled PWD_AUTH frame on a protected NTAG left the read at NAK, skipped
+`transient_` (NAK is excluded) and fired `unsupported_tag`, latched until lift.
+Six failed SELECTs and a spent transient budget likewise reported
+`unsupported_tag` or `bad_mac` about a good card. **Fixed:** PWD_AUTH frame
+errors are transient; a link that gives up fires `read_fail` (no card_id, no
+verdict), answered in Home Assistant with HOLD; during enrollment the silent
+retry is kept so an unread card is never blanked.
+
+#### F-69 — An interior tap during an entry was read as an exit — **BUG, the reported sequence**
+
+The interior reader only meant exit intent. Tapping inside before the door was
+shut opened an exit window against an open door (it can never complete), and in
+elevated mode started a fresh MFA after the person had authenticated — MFA on
+screen, then a major alarm on timeout or via F-70. **Fixed:**
+`input_text.guardian_last_entry` records the last completed entry (passage
+completion and a cleared challenge); the same card at the interior reader within
+180 s, door open or shut ≤ 15 s, nothing pending, is ENTRY_DONE: GRANTED,
+nothing started. Clone, stolen and HOLD precede it.
+
+#### F-70 — A correct card-and-PIN at an already-open door was an alarm — **BUG, fail-noisy**
+
+The PIN handler raised "Door was already open when MFA was completed" whenever
+the contact read open. After F-49 every opening during an MFA becomes a
+challenge, so the only remaining signature is a door that opened after the MFA
+began. **Fixed:** compares the contact's `last_changed` with
+`portal_mfa_pending`'s (captured before it is cleared); alarms only for "opened
+after", reason *Door opened during MFA without a challenge*.
+
+#### F-71 — An elevated arrival stayed Away — **BUG**
+
+Doorbell scan (reconcile: Away), open, PIN at the keypad: nothing set the card
+At home — Complete Authorized Passage needs a window the MFA branch cancels — so
+`house_empty` and the Frigate away-push misjudged the house. **Fixed:**
+`guardian_clear_entry_challenge` sets a resident slot At home unless the
+opening's origin was `inside`.
+
+#### F-72 — No elevated alarm said why the house was elevated — **HARDENING**
+
+`binary_sensor.guardian_elevated_mode` gains attribute `source` (manual switch,
+or the created and enabled programs — the window arithmetic is not duplicated),
+and elevated-mode alarm reasons append `· SS: <source>`.
+
+#### Hardening: the last scan, in one line
+
+`process_rfid_scan` computes one `verdict` from the choose's own ladder (the
+trace's copy had drifted) and always writes `input_text.guardian_last_scan`
+(no `initial:`): reader, slot, verdict, result, reported and pre-scan stored
+counter, rotate, window.
+
+#### Checked, not bugs
+
+Queued `process_rfid_scan` runs are serial and render variables at run start,
+so two readers cannot test the same stored counter; `counter_ok` fails only if
+the helper write failed; both readers report `rotated` identically from one
+component; `rotated && reported <= stored` cannot be produced by two readers in
+one passage, since a rotate is reported only after read-back. The Elevated
+Opening Supervisor, Entry Challenge Timeout, MFA Timeout and Door Left Open all
+require elevated mode; Unscanned Key Entry and Uncertain Door Direction never
+alarm; the offline siren's stale-belief bound is unchanged and documented.
+
+### 8.9 Forty-ninth pass (doorbell read range through its cover)
+
+A live report: the doorbell reads with its cover off, not with it fitted, and
+used to. Firmware only, version **2.33.0**, not compiled. Live checks are
+`DEPLOY.md` forty-ninth-pass items 351–356.
+
+#### F-73 — The doorbell ran at the PCD's reset receiver gain — **HARDENING**
+
+The seventeenth pass (§22) removed the `RFCfgReg = 0x70` (48 dB) write together
+with the phantom-RxIRq fixes, crediting it with "TX ringing looking like a
+frame". RxNoErr and RxWait are what gate ringing, and both stay. Both readers
+have run at 33 dB since, as stock `rc522` always did.
+
+**Not the cause of the regression.** No firmware that ever read a card ran at
+48 dB: the only one that did failed SELECT on every tap. The RF register setup
+is unchanged since 2026-08-22, and the last RF-path change (CRC_A on SAK,
+CollErr rejected) is 2026-08-28. A loss of cover range after that is physical.
+
+**Hardened:** `rx_gain` per reader (default 33 dB, the reset value; doorbell
+48 dB), applied in `pcd_init_()` with RFCfgReg's reserved bits kept, re-checked
+each poll where it differs from reset (a mismatch re-runs `pcd_init_()`, since
+a PCD reset also lost RxSel, TxASK and the timer), read back at boot and in the
+config dump. `cw_conductance` (CWGsPReg) exists, unset on both. Since-boot WUPA
+answers and SELECT failures are logged at WARN/INFO so a range problem shows
+without DEBUG.
+

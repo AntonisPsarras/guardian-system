@@ -481,6 +481,28 @@ input_text:
     name: Guardian Last Door Summary
     initial: none
     max: 64
+  # "<slots>|<epoch seconds>" of the last completed ENTRY: written by
+  # "Guardian: Complete Authorized Passage" for an entry and by
+  # script.guardian_clear_entry_challenge. process_rfid_scan reads it so the
+  # same card tapped on the interior portal within three minutes, before the
+  # door is shut, finishes that entry instead of starting an exit window or a
+  # fresh MFA. Session state, so `initial: none` is right: after a restart
+  # there is no entry in progress.
+  guardian_last_entry:
+    name: Guardian Last Entry
+    initial: none
+    max: 64
+  # One line per card scan, always written by process_rfid_scan:
+  # "21:04:13 portal slot 2 ENTRY_DONE r=ok c=41 s=40 rot=1 win=1". Reader,
+  # slot, verdict, the reader's result and counter, the counter Home Assistant
+  # held before the scan, whether the card rotated, and whether the freshness
+  # window accepted it. The next "my key was refused" is diagnosable from this
+  # line alone, without having switched verbose notifications on beforehand.
+  # NO `initial:` - it has to survive the restart somebody does while trying
+  # to fix the problem it describes.
+  guardian_last_scan:
+    name: Guardian Last Card Scan
+    max: 255
   # The lamp's state immediately BEFORE a sample blacks the bulb out, as
   # "off" or "on|<brightness>|<kelvin>".
   #
@@ -491,9 +513,16 @@ input_text:
   # needed to restore it. The watchdog cleared the sampling flag and walked
   # away. At night that is indistinguishable from "the lamp turned itself off",
   # which is exactly what was reported.
+  #
+  # NO `initial:`. It carried `initial: none` until the forty-eighth pass, and
+  # an initial is applied on every start and SKIPS restore_state - so after the
+  # one interruption the docs above name first, a restart, the watchdog's
+  # homeassistant:start branch always read "none" and restored nothing. The
+  # restart half of this helper had never worked. The sampler clears it to
+  # `none` at the end of every finished run and the watchdog clears it after a
+  # restore, so a restored value is always one a real interrupted run left.
   guardian_lamp_presample:
     name: Guardian Lamp Pre-Sample State
-    initial: none
     max: 40
   # One line describing the most recent lamp decision, e.g.
   # "22:20 luma=31.4 sun=-12.3 on_camera manual" or "22:20 FAILED no reading".
@@ -1048,8 +1077,17 @@ template:
              an ambient.jpg that is minutes old, trips the 60s staleness guard
              in guardian-luminance.py, and exits non-zero - so outside the few
              seconds of an actual sample the sensor is *expected* to be
-             unavailable. The sampler's own verdict is the honest signal. #}
-          {% if 'FAILED' in states('input_text.guardian_lamp_last_result') %}
+             unavailable. The sampler's own verdict is the honest signal.
+
+             And then it was "'FAILED' in guardian_lamp_last_result", which
+             made ONE failed sample a fault - and the sampler wrote FAILED for
+             holds as well as failures, including a lamp that was merely
+             offline. At dusk that lit LUMA every ten minutes on a system that
+             was working. The streak is the honest form of the same signal:
+             it counts only samples that produced no reading, resets on a good
+             one, and three in a row is the threshold the sampler already used
+             to decide the chain is broken and push to the phones. #}
+          {% if states('input_number.guardian_lamp_fail_streak') | int(0) >= 3 %}
             {% set ns.f = ns.f + ['LUMA'] %}
           {% endif %}
           {# esphome/portal-unit.yaml declares this with device_class: problem
@@ -1359,6 +1397,36 @@ template:
             {% endif %}
           {% endfor %}
           {{ manual or ns.on }}
+        # WHY elevated mode is on, for alarm reasons. An alarm that says
+        # "Elevated-mode opening ... not authenticated" was true and useless to a
+        # household that did not know elevated mode was on at all - Create
+        # Program arms 00:00-05:00 every day the moment it is pressed, and a
+        # leftover program is adopted as created. This names the switch, or the
+        # created AND enabled programs, so the push says which one to look at.
+        #
+        # Deliberately NOT the window arithmetic: that stays in the state
+        # template above as its only copy. When the manual switch is off and the
+        # state is on, one of the enabled programs matched by construction, and
+        # listing the enabled ones is enough to point at it. Built only from
+        # states() / is_state() on rack ids from sensor.guardian_ss_programs, so
+        # it cannot raise.
+        attributes:
+          source: >-
+            {% if is_state('input_boolean.super_surveillance_mode', 'on') %}manual switch
+            {%- else %}
+              {%- set rack = (states('sensor.guardian_ss_programs') | string).split(',')
+                             | map('trim') | reject('eq', '') | list -%}
+              {%- set ns = namespace(n=[]) -%}
+              {%- for raw in (states('sensor.guardian_ss_programs_created') | string).split(',') -%}
+                {%- set p = raw | trim -%}
+                {%- if p in rack and is_state('input_boolean.guardian_ss_' ~ p ~ '_enabled', 'on') -%}
+                  {%- set nm = states('input_text.guardian_ss_' ~ p ~ '_name') | string | trim -%}
+                  {%- set ns.n = ns.n + [nm if nm not in ['', 'none', 'unknown', 'unavailable']
+                                         else 'Program ' ~ p] -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{- ('schedule ' ~ (ns.n | join(', '))) if ns.n else 'schedule' -}}
+            {%- endif %}
 
       # Normalised doorbell reachability. The ESPHome "status" platform is the
       # canonical signal: Home Assistant keeps that one entity available when
@@ -1582,7 +1650,7 @@ template:
       - name: Guardian Version
         unique_id: guardian_version
         icon: mdi:tag-check-outline
-        state: '2.32.5'
+        state: '2.33.0'
         attributes:
           rfid_package: >-
             {% set v = states('sensor.guardian_rfid_version') %}
@@ -1714,11 +1782,22 @@ command_line:
 # The values stay quoted arguments, which is what exec wants and what keeps a
 # negative sun elevation from being parsed as a flag. The file write moved into
 # the probe, where it needs no shell at all.
+#
+# THE FOURTH ARGUMENT WAS MISSING until the forty-eighth pass. The probe's
+# --write-run takes mode, sun, rotate AND ir, and reads ir=1 as "a night-vision
+# entity is configured, so the sampler switched infrared off for this frame".
+# With three arguments ir was always empty, so the probe believed IR was never
+# configured and applied the night-vision greyscale cap (luma 12.0) to frames
+# taken with IR already off. ir is 1 exactly when the sampler's own ir_valid
+# would be: the helper names a well-formed entity that is not unknown or
+# unavailable. The regex guard keeps a typed-in junk value from ever reaching
+# states() as an entity id.
 shell_command:
   guardian_luma_write_run: >-
     python3 /config/guardian/guardian-luminance.py --write-run
     '{{ "auto" if is_state("input_select.guardian_lamp_luma_mode", "Auto-calibrate") else "manual" }}'
     '{{ state_attr("sun.sun", "elevation") | float(0) }}'
     '{{ states("input_number.guardian_luma_rotate") | int(90) }}'
+    '{% set e = states("input_text.guardian_camera_ir_entity") | string | trim %}{{ 1 if e is match("^[a-z_]+\.[a-z0-9_]+$") and states(e) not in ["unknown", "unavailable"] else 0 }}'
     '{% set ir = states("input_text.guardian_camera_ir_entity") | string | trim %}{{ 1 if ir not in ["", "none", "unknown", "unavailable"] and states(ir) not in ["unknown", "unavailable"] else 0 }}'
   guardian_luma_retune: python3 /config/guardian/guardian-luminance.py --retune

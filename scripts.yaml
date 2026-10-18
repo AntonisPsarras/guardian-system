@@ -140,7 +140,9 @@ process_rfid_scan:
       description: doorbell or interior_portal
       required: true
     result:
-      description: ok, enrolled, write_fail, bad_mac, or unsupported_tag
+      description: >-
+        ok, enrolled, write_fail, bad_mac, unsupported_tag, or read_fail (the
+        reader gave up on a link error; no card_id, no verdict about the card)
       required: false
     card_id:
       description: 16-character hex card_id from the on-card authenticator
@@ -377,6 +379,14 @@ process_rfid_scan:
       presence_before: >-
         {% set i = matched_slot | string | trim %}
         {{ states('input_select.rfid_' ~ i) | string | trim }}
+      # The counter Home Assistant held BEFORE this scan, for the verdict line
+      # below. The comparison that decides CLONE is this number against the
+      # reported one, so a diagnostic that only showed the value after the
+      # write could not explain its own verdict. -1 when nothing matched; the
+      # conditional keeps a junk entity id away from states().
+      stored_before: >-
+        {% set i = matched_slot | string | trim %}
+        {{ (states('input_number.rfid_' ~ i ~ '_counter') | int(0)) if i else -1 }}
       door_closed: "{{ is_state('binary_sensor.guardian_interior_portal_door_contact', 'off') }}"
       # Exterior reader, door shut, elevated: the keypad is unreachable. Either
       # a live 30s challenge (they just walked out) or presence still At home
@@ -419,73 +429,6 @@ process_rfid_scan:
           Stolen key: {{ matched_name if matched_name else 'Key ' ~
           (matched_slot | string | trim) }} at {{ 'door' if source == 'doorbell'
           else 'portal' }}
-  # Decision trace. OFF unless input_boolean.guardian_verbose_notifications is on.
-  #
-  # This lives HERE, inside the script, rather than in an automation watching the
-  # event, because it has to report the variables the choose below will actually
-  # branch on. Every other vantage point - the device log, the event bus, a
-  # template sensor - shows an input to this decision rather than the decision,
-  # and the failures being chased have all been cases where the inputs looked
-  # right and the outcome was still wrong.
-  #
-  # It names the branch outright, computed from the same conditions in the same
-  # order, so "which branch ran" stops being an inference from an LED colour.
-  - if:
-    - condition: state
-      entity_id: input_boolean.guardian_verbose_notifications
-      state: 'on'
-    then:
-    # continue_on_error: this is a diagnostic, and it sits in front of every
-    # alert the scan can raise - the stolen-key alarm, the clone push and the
-    # clone alarm all come after it. A trace that can cancel the thing it exists
-    # to explain is worse than no trace.
-    - action: persistent_notification.create
-      continue_on_error: true
-      data:
-        notification_id: "guardian_scan_trace_{{ now().strftime('%H%M%S') }}"
-        title: >-
-          {{ now().strftime('%H:%M:%S') }} {{ source }} ->
-          {%- set m = matched_slot | string | trim -%}
-          {%- set valid = slot_ok | bool -%}
-          {% if valid and states('input_select.rfid_' ~ m)
-                in ['Stolen', 'Stolen/Lost'] %} STOLEN
-          {%- elif doorbell_exit | bool %} DOORBELL EXIT PIN
-          {%- elif challenge_active | bool and valid %} CHALLENGE CARD
-          {%- elif enroll_mode | bool and valid %} ENROLL_DUP
-          {%- elif valid and not (window_ok | bool) and scan_result not in ['', 'enrolled'] %} CLONE
-          {%- elif enroll_hold | bool %} HOLD
-          {%- elif valid and elevated_mode | bool %} MFA
-          {%- elif valid %} GRANTED (passage)
-          {%- elif enroll_mode | bool and tag_unsupported | bool %} UNSUPPORTED
-          {%- elif enroll_mode | bool and enroll_hold | bool %} HOLD
-          {%- elif enroll_mode | bool and target_ok | bool %} ENROLL -> slot {{ target_slot | string | trim }}
-          {%- elif enroll_mode | bool %} ENROLL_PICK (no target slot)
-          {%- elif tag_unsupported | bool %} UNSUPPORTED
-          {%- else %} DENIED_CARD{% endif %}
-        message: >-
-          result: {{ scan_result }}
-          · card_id_len: {{ card_id_norm | length }}
-          · counter: {{ counter_n }}
-          · rotated: {{ rotated_b }}
-          · window: {{ window_ok }}
-
-          matched_slot: '{{ matched_slot | string | trim }}'
-          · empty_slot: '{{ empty_slot | trim }}'
-          · target_slot: '{{ target_slot | string | trim }}'
-
-          enroll_mode: {{ enroll_mode }}
-          · guest: {{ enroll_as_visitor }}
-          · elevated: {{ elevated_mode }}
-          · challenge: {{ challenge_active }}
-          · doorbell_exit: {{ doorbell_exit }}
-          · presence_before: '{{ presence_before }}'
-
-          enrollment_slot helper: '{{ states('input_text.guardian_enrollment_slot') }}'
-
-          stored: {% set ids = (states('sensor.guardian_rfid_slots') | string).split(',')
-                               | map('trim') | reject('eq', '') | list %}{% for i in ids %}{{ i }}={{
-            states('input_text.rfid_' ~ i ~ '_card_id') | string | trim | lower | length }}ch/c{{
-            states('input_number.rfid_' ~ i ~ '_counter') | int(0) }} {% endfor %}
   # Self-correction, before any branch. The reader a card was presented to tells
   # us which side of the door that card is physically on, so a card recorded as
   # "Away" and scanned on the interior portal - or "At home" and scanned at the
@@ -530,6 +473,164 @@ process_rfid_scan:
       counter_ok: "{{ (not (slot_ok | bool) or not (rotated_b | bool)) or
         (states('input_number.rfid_' ~ (matched_slot | string | trim) ~ '_counter')
          | int(0) >= (counter_n | int(0))) }}"
+  # AN INTERIOR TAP DURING AN ENTRY IS THE SAME PERSON FINISHING IT.
+  #
+  # The household's report: come in from outside (doorbell scan, door open),
+  # tap the same card on the interior portal before the door is shut, and from
+  # then on the system "rejects" it. Two things were going wrong, and this is
+  # the Home Assistant half (the other is a torn MAC write, healed on the
+  # readers). The interior reader is only ever read as EXIT intent, so:
+  #
+  #   * outside elevated mode it opened a 20 s exit window against a door that
+  #     was already open. No opening could follow to complete it, it expired,
+  #     and if the door was opened again inside those 20 s - fetching the
+  #     shopping - that was booked as this person leaving;
+  #   * in elevated mode it started a fresh MFA after the person had already
+  #     authenticated their way in, put MFA on the screen instead of GRANTED,
+  #     and then ended in a major alarm either way: the MFA timed out, or the
+  #     right PIN was typed with the door open, which the PIN handler treated
+  #     as an unsupervised opening.
+  #
+  # Modelled explicitly: this slot completed an entry in the last three minutes
+  # (input_text.guardian_last_entry, written by "Guardian: Complete Authorized
+  # Passage" and by guardian_clear_entry_challenge), the scan is at the interior
+  # reader, the door is still open or shut within the last 15 s, and no MFA,
+  # challenge or doorbell-exit PIN is pending. Then the tap is acknowledged and
+  # nothing else is started. Clone, stolen and HOLD verdicts still win - they
+  # are earlier in the choose, and this branch requires a clean counter.
+  #
+  # The door reads are behind is_state() short-circuits, so a missing contact
+  # entity is "false", never a TemplateError in front of the choose.
+  - variables:
+      entry_finish: >-
+        {% set m = matched_slot | string | trim %}
+        {% set raw = states('input_text.guardian_last_entry') | string | trim %}
+        {% set parts = raw.split('|') %}
+        {% set who = (parts[0].split(',') | map('trim') | reject('eq', '') | list)
+             if parts | count == 2 else [] %}
+        {% set at = (parts[1] | float(0)) if parts | count == 2 else 0 %}
+        {% set door_on = is_state('binary_sensor.guardian_interior_portal_door_contact', 'on') %}
+        {% set door_just_shut = is_state('binary_sensor.guardian_interior_portal_door_contact', 'off')
+             and (as_timestamp(now()) - as_timestamp(
+                  states.binary_sensor.guardian_interior_portal_door_contact.last_changed, 0)) <= 15 %}
+        {{ source == 'interior_portal' and (slot_ok | bool) and m in who
+           and (as_timestamp(now()) - at) <= 180
+           and (door_on or door_just_shut)
+           and (counter_ok | bool) and scan_result in ['', 'ok']
+           and not is_state('input_boolean.portal_mfa_pending', 'on')
+           and not is_state('input_boolean.guardian_entry_challenge', 'on')
+           and not is_state('input_boolean.guardian_doorbell_exit_pin', 'on') }}
+  # ONE VERDICT, computed from the same conditions in the same order as the
+  # choose below. The decision trace used to carry its own copy of this ladder,
+  # and it had drifted from the choose (STOLEN and DOORBELL EXIT ahead of CLONE,
+  # no HOLD for a counter that did not save), so the one tool for "which branch
+  # ran" could name the wrong one. The trace and the durable last-scan line now
+  # both print this. If you add a branch to the choose, add it here in the same
+  # place.
+  - variables:
+      verdict: >-
+        {% set m = matched_slot | string | trim %}
+        {% set valid = slot_ok | bool %}
+        {% set stolen = valid and states('input_select.rfid_' ~ m) in ['Stolen', 'Stolen/Lost'] %}
+        {% if scan_result == 'read_fail' %}READ_FAIL
+        {%- elif tag_unsupported | bool %}UNSUPPORTED
+        {%- elif valid and scan_result not in ['', 'enrolled'] and not (window_ok | bool)
+                 and not stolen %}CLONE
+        {%- elif enroll_mode | bool and not valid and enroll_hold | bool %}HOLD
+        {%- elif stolen %}STOLEN
+        {%- elif valid and rotated_b | bool and not (counter_ok | bool) %}HOLD_COUNTER
+        {%- elif enroll_hold | bool and valid %}HOLD
+        {%- elif doorbell_exit | bool and valid %}DOORBELL_EXIT_PIN
+        {%- elif challenge_active | bool and valid %}CHALLENGE_CARD
+        {%- elif enroll_mode | bool and valid %}ENROLL_DUP
+        {%- elif entry_finish | bool %}ENTRY_DONE
+        {%- elif valid and elevated_mode | bool %}MFA
+        {%- elif valid and counter_ok | bool and scan_result in ['', 'ok'] %}GRANTED
+        {%- elif enroll_mode | bool and target_ok | bool
+                 and not (card_id_norm | length == 16 and card_id_norm is match('^[0-9a-f]{16}$')) %}HOLD
+        {%- elif enroll_mode | bool and target_ok | bool %}ENROLL
+        {%- elif enroll_mode | bool %}ENROLL_PICK
+        {%- else %}DENIED_CARD{% endif %}
+  # THE LAST SCAN, IN ONE LINE THAT SURVIVES A RESTART. "Random" denials have
+  # cost more than one pass because the evidence was a persistent notification
+  # that only existed with verbose mode switched on beforehand. This is always
+  # written: reader, slot, verdict, reported result, reported counter, the
+  # counter Home Assistant held before the scan, whether the reader rotated, and
+  # whether the freshness window accepted it - which is everything needed to
+  # tell HOLD from CLONE from a read failure from a counter desync, and is shown
+  # on More -> Internals. No `initial:` on the helper, so the morning after
+  # still has it. Guarded, and built only from this script's own variables.
+  - action: input_text.set_value
+    continue_on_error: true
+    target:
+      entity_id: input_text.guardian_last_scan
+    data:
+      value: >-
+        {%- set m = matched_slot | string | trim -%}
+        {{ (now().strftime('%H:%M:%S') ~ ' ' ~ ('door' if source == 'doorbell' else 'portal')
+            ~ ' ' ~ (('slot ' ~ m) if slot_ok | bool else 'no-match')
+            ~ ' ' ~ (verdict | string | trim)
+            ~ ' r=' ~ (scan_result if scan_result else 'none')
+            ~ ' c=' ~ (counter_n | string)
+            ~ ' s=' ~ (stored_before | string)
+            ~ ' rot=' ~ ('1' if rotated_b | bool else '0')
+            ~ ' win=' ~ ('1' if window_ok | bool else '0'))[:255] }}
+  # Decision trace. OFF unless input_boolean.guardian_verbose_notifications is on.
+  #
+  # This lives HERE, inside the script, rather than in an automation watching the
+  # event, because it has to report the variables the choose below will actually
+  # branch on. Every other vantage point - the device log, the event bus, a
+  # template sensor - shows an input to this decision rather than the decision,
+  # and the failures being chased have all been cases where the inputs looked
+  # right and the outcome was still wrong.
+  #
+  # It names the branch outright from `verdict` above. It used to sit in front
+  # of reconcile and the counter write with its own ladder, which could not see
+  # counter_ok and had drifted from the choose; it moved down here in the
+  # forty-eighth pass so it reports the decision the choose is about to make.
+  - if:
+    - condition: state
+      entity_id: input_boolean.guardian_verbose_notifications
+      state: 'on'
+    then:
+    # continue_on_error: this is a diagnostic, and it sits in front of the clone
+    # push and the clone alarm. A trace that can cancel the thing it exists to
+    # explain is worse than no trace.
+    - action: persistent_notification.create
+      continue_on_error: true
+      data:
+        notification_id: "guardian_scan_trace_{{ now().strftime('%H%M%S') }}"
+        title: >-
+          {{ now().strftime('%H:%M:%S') }} {{ source }} -> {{ verdict | string | trim }}
+          {%- if (verdict | string | trim) in ['ENROLL'] %} slot {{ target_slot | string | trim }}{% endif %}
+        message: >-
+          result: {{ scan_result }}
+          · card_id_len: {{ card_id_norm | length }}
+          · counter: {{ counter_n }}
+          · stored before: {{ stored_before }}
+          · rotated: {{ rotated_b }}
+          · window: {{ window_ok }}
+          · counter_ok: {{ counter_ok }}
+
+          matched_slot: '{{ matched_slot | string | trim }}'
+          · empty_slot: '{{ empty_slot | trim }}'
+          · target_slot: '{{ target_slot | string | trim }}'
+
+          enroll_mode: {{ enroll_mode }}
+          · guest: {{ enroll_as_visitor }}
+          · elevated: {{ elevated_mode }}
+          · challenge: {{ challenge_active }}
+          · doorbell_exit: {{ doorbell_exit }}
+          · entry_finish: {{ entry_finish }}
+          · presence_before: '{{ presence_before }}'
+
+          enrollment_slot helper: '{{ states('input_text.guardian_enrollment_slot') }}'
+          · last entry: '{{ states('input_text.guardian_last_entry') }}'
+
+          stored: {% set ids = (states('sensor.guardian_rfid_slots') | string).split(',')
+                               | map('trim') | reject('eq', '') | list %}{% for i in ids %}{{ i }}={{
+            states('input_text.rfid_' ~ i ~ '_card_id') | string | trim | lower | length }}ch/c{{
+            states('input_number.rfid_' ~ i ~ '_counter') | int(0) }} {% endfor %}
   # WHETHER THIS KEY IS PASSWORD-PROTECTED ON THE CARD. Recorded here, shown in
   # the panel's key list, and USED FOR NOTHING ELSE.
   #
@@ -584,6 +685,31 @@ process_rfid_scan:
                 + [slot ~ ('u' if protected_norm == 'false' else 'p')] -%}
           {{- ns.out | sort | join(',') -}}
   - choose:
+    # The reader could not complete the exchange - a garbled frame it retried
+    # until its budget ran out, a PWD_AUTH frame lost in the noise, a tag at the
+    # edge of the field that never answered SELECT cleanly. That is about the
+    # radio, not the card, so it carries no card_id and must reach no verdict:
+    # it used to arrive as unsupported_tag (UNSUPPORTED) or bad_mac (HOLD with
+    # re-enroll advice) about a key that was perfectly good. HOLD, retap. No
+    # event, no push; the always-on last-scan line above records it.
+    - conditions:
+      - condition: template
+        value_template: "{{ scan_result == 'read_fail' }}"
+      sequence:
+      - action: script.guardian_set_display
+        data:
+          value: HOLD
+      - action: button.press
+        continue_on_error: true
+        target:
+          entity_id: button.guardian_interior_portal_play_denied
+      - if:
+        - condition: template
+          value_template: '{{ enroll_mode | bool }}'
+        then:
+        - action: timer.start
+          target:
+            entity_id: timer.guardian_enrollment_window
     - conditions:
       - condition: template
         value_template: '{{ tag_unsupported | bool }}'
@@ -946,6 +1072,25 @@ process_rfid_scan:
       - action: timer.start
         target:
           entity_id: timer.guardian_enrollment_window
+    # The person who just came in, tapping inside before the door is shut. See
+    # entry_finish above: acknowledge, and start nothing - no exit window for a
+    # door that is already open, and no fresh MFA for someone who has already
+    # authenticated this opening. Placed before the elevated MFA branch, which
+    # is the one it exists to keep this tap out of.
+    - conditions:
+      - condition: template
+        value_template: '{{ entry_finish | bool }}'
+      sequence:
+      - action: script.guardian_set_display
+        data:
+          value: GRANTED
+      - action: button.press
+        continue_on_error: true
+        target:
+          entity_id: button.guardian_interior_portal_play_welcome
+      - action: script.turn_on
+        target:
+          entity_id: script.guardian_lamp_success
     - conditions:
       - condition: template
         value_template: '{{ slot_ok | bool }}'
@@ -1617,6 +1762,11 @@ guardian_restore_lamp:
           {{ s in ['(255,150,0)', '[255,150,0]', '(255,0,0)', '[255,0,0]',
                    '(0,255,0)', '[0,255,0]'] }}
         {%- endif %}
+  # Every light call below is guarded. This script is called blocking by the
+  # sampler, the feedback queue, the challenge hold and the sampling watchdog,
+  # so a cloud bulb raising here used to end the CALLER - most visibly the
+  # sampler, mid-blackout, leaving the porch dark until the watchdog put back
+  # whatever the stash said.
   - choose:
     - conditions:
       - condition: template
@@ -1630,6 +1780,7 @@ guardian_restore_lamp:
               and not (rgb_hold | bool) }}'
           sequence:
           - action: light.turn_on
+            continue_on_error: true
             target:
               entity_id: "{{ lamp }}"
             data:
@@ -1642,6 +1793,7 @@ guardian_restore_lamp:
               0 }}'
           sequence:
           - action: light.turn_on
+            continue_on_error: true
             target:
               entity_id: "{{ lamp }}"
             data:
@@ -1658,12 +1810,14 @@ guardian_restore_lamp:
               value_template: '{{ rgb_hold | bool }}'
             sequence:
             - action: light.turn_off
+              continue_on_error: true
               target:
                 entity_id: "{{ lamp }}"
               data:
                 transition: 0
           default:
           - action: light.turn_on
+            continue_on_error: true
             target:
               entity_id: "{{ lamp }}"
             data:
@@ -1671,6 +1825,7 @@ guardian_restore_lamp:
               transition: 0
     default:
     - action: light.turn_off
+      continue_on_error: true
       target:
         entity_id: "{{ lamp }}"
       data:
@@ -2084,6 +2239,53 @@ guardian_clear_entry_challenge:
       origin: '{{ origin }}'
       detail: "{{ detail | default('', true) }}"
       timestamp: '{{ now().isoformat() }}'
+  # The authenticated slot owns this opening. Recorded for process_rfid_scan's
+  # entry_finish, so the same card tapped inside before the door is shut is
+  # acknowledged instead of starting an MFA that would time out into a major
+  # alarm - which is what an elevated-mode arrival did, every time somebody
+  # tapped in "to be sure".
+  #
+  # And presence. The usual elevated arrival is doorbell scan (reconcile sets
+  # Away - the card is outside), door opened, challenge answered with the PIN at
+  # the keypad. Nothing then ever set the card At home: Complete Authorized
+  # Passage needs a passage window, and the MFA branch cancels those. So the
+  # person who just authenticated their way in read Away for the rest of the
+  # night, house_empty could come out true with them asleep upstairs, and the
+  # Frigate "person detected while away" push fired on them. An opening the
+  # IMU called "inside" is someone in the house who opened the door - they may
+  # be going out - so presence is left alone for that one. Visitors are never
+  # occupants. Guarded and option-checked like guardian_reconcile_presence:
+  # this script is called blocking from process_rfid_scan and the PIN handler.
+  - if:
+    - condition: template
+      value_template: >-
+        {{ (slot | default('', true) | string | trim) in
+           ((states('sensor.guardian_rfid_slots') | string).split(',')
+            | map('trim') | reject('eq', '') | list) }}
+    then:
+    - action: input_text.set_value
+      continue_on_error: true
+      target:
+        entity_id: input_text.guardian_last_entry
+      data:
+        value: "{{ slot | string | trim }}|{{ as_timestamp(now()) | int(0) }}"
+    - variables:
+        cleared_slot: "{{ slot | string | trim }}"
+    - if:
+      - condition: template
+        value_template: >-
+          {{ origin != 'inside'
+             and (states('input_select.rfid_' ~ cleared_slot ~ '_policy') | string | trim) != 'visitor'
+             and states('input_select.rfid_' ~ cleared_slot) == 'Away'
+             and 'At home' in (state_attr('input_select.rfid_' ~ cleared_slot, 'options')
+                               | default([], true) | list) }}
+      then:
+      - action: input_select.select_option
+        continue_on_error: true
+        target:
+          entity_id: input_select.rfid_{{ cleared_slot }}
+        data:
+          option: At home
   # Informational, not high priority. An answered challenge is the system working
   # as designed; only an unanswered one is an alarm. Card answers go to that
   # person; PIN answers have no slot and broadcast.
@@ -2625,6 +2827,7 @@ guardian_apply_lamp_sun_mismatch:
         value_template: '{{ night }}'
       sequence:
       - action: light.turn_on
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -2644,6 +2847,7 @@ guardian_apply_lamp_sun_mismatch:
         value_template: '{{ day }}'
       sequence:
       - action: light.turn_off
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -2850,7 +3054,10 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED already_running hold"
+        # HELD, not FAILED - see the alarm hold just below for why the word
+        # matters. A stuck flag is the watchdog's to clear, and it records its
+        # own FAILED interrupted when it does.
+        value: "{{ now().strftime('%H:%M') }} HELD already_running"
     - stop: Sample already running, or the sampling flag is stuck on
   - if:
     - condition: template
@@ -2873,8 +3080,10 @@ guardian_sample_ambient_light:
         # now raises one on a scan, which is what surfaced it.
         #
         # The sibling holds above and below (already_running, challenge,
-        # feedback) are the same class of non-failure and still say FAILED.
-        # Left alone deliberately - they are not on this path.
+        # feedback, lamp_offline, no_lamp) are the same class of non-failure
+        # and said FAILED until the forty-eighth pass, which is how a Tapo that
+        # dropped off Wi-Fi at dusk lit LUMA every ten minutes. They are HELD
+        # now too; only a sample that produced no usable reading says FAILED.
         value: "{{ now().strftime('%H:%M') }} HELD alarm"
     - stop: Alarm owns the lamp
   - if:
@@ -2886,7 +3095,7 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED challenge hold"
+        value: "{{ now().strftime('%H:%M') }} HELD challenge"
     - stop: Challenge owns the lamp
   - if:
     - condition: state
@@ -2897,8 +3106,22 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED feedback hold"
+        value: "{{ now().strftime('%H:%M') }} HELD feedback"
     - stop: Lamp feedback flash in progress
+  # THE LAMP BEING OFFLINE IS NOT A MEASUREMENT FAILURE, and reporting it as one
+  # is what the household saw at dusk: "FAILED lamp_unavailable hold", a fail
+  # streak increment and a fresh "ambient light sampling failed" notification
+  # on every ten-minute tick - ten, because a lamp that is off (or offline)
+  # samples on the fast cadence. A Tapo that dropped off its cloud for a minute,
+  # or a porch bulb switched off at the wall, was rendered as a broken sensor
+  # chain and lit LUMA on the panel and the portal.
+  #
+  # Nothing was measured and nothing could be switched, so this is a hold: it is
+  # recorded, it does not touch the streak, and it does not notify. The camera
+  # and the probe are not implicated. "Guardian: Camera-Based Lamp Control"
+  # samples again within ~30s of the bulb coming back (its lamp_back trigger),
+  # which is where the sun fallback this used to skip actually gets applied -
+  # there is no bulb to apply it to while it is offline.
   - if:
     - condition: template
       value_template: '{{ not lamp_ok }}'
@@ -2907,22 +3130,9 @@ guardian_sample_ambient_light:
       target:
         entity_id: input_text.guardian_lamp_last_result
       data:
-        value: "{{ now().strftime('%H:%M') }} FAILED lamp_unavailable hold"
-    - action: input_number.set_value
-      target:
-        entity_id: input_number.guardian_lamp_fail_streak
-      data:
-        value: "{{ [(states('input_number.guardian_lamp_fail_streak') | int(0)
-          + 1), 99] | min }}"
-    - action: persistent_notification.create
-      data:
-        notification_id: guardian_luminance_unusable
-        title: 'Guardian: ambient light sampling failed'
-        message: >-
-          The configured lamp (sensor.guardian_lamp_entity) is unknown or
-          unavailable, so the sampler cannot
-          switch it. Last result:
-          {{ states('input_text.guardian_lamp_last_result') }}.
+        value: >-
+          {{ now().strftime('%H:%M') }} HELD
+          {{- ' no_lamp' if lamp in ['none', '', 'unknown', 'unavailable'] else ' lamp_offline' }}
     - stop: Lamp entity is not ready
   - if:
     - condition: template
@@ -2938,7 +3148,12 @@ guardian_sample_ambient_light:
         - condition: template
           value_template: "{{ abort_decision | trim == 'on_sun' }}"
         sequence:
+        # Guarded like every lamp call in this script since the forty-eighth
+        # pass: a cloud bulb that answers "unavailable" mid-call raises
+        # HomeAssistantError, which ended the run before the verdict was
+        # written. The `none` sentinel above already covers vol.Invalid.
         - action: light.turn_on
+          continue_on_error: true
           target:
             entity_id: "{{ lamp }}"
           data:
@@ -2953,6 +3168,7 @@ guardian_sample_ambient_light:
           value_template: "{{ abort_decision | trim == 'off_sun' }}"
         sequence:
         - action: light.turn_off
+          continue_on_error: true
           target:
             entity_id: "{{ lamp }}"
           data:
@@ -2971,32 +3187,50 @@ guardian_sample_ambient_light:
       data:
         value: "{{ [(states('input_number.guardian_lamp_fail_streak') | int(0)
           + 1), 99] | min }}"
-    - action: persistent_notification.create
-      data:
-        notification_id: guardian_luminance_unusable
-        title: 'Guardian: ambient light sampling failed'
-        message: >-
-          No usable camera for a snapshot (helper
-          "{{ states('input_text.guardian_camera_entity') }}", resolved
-          "{{ camera_entity }}"). The lamp fell back to sun elevation and was
-          {{ 'switched on' if abort_decision | trim == 'on_sun'
-             else ('switched off' if abort_decision | trim == 'off_sun'
-             else 'left as it was') }}. Set More → Install to camera.door_camera
-          and Save. See DEPLOY.md.
+    # One failed sample is routine (the Frigate/Tapo integration drops the
+    # camera entity for a minute fairly often) and the verdict above already
+    # records it. Three in a row is the same threshold LUMA and the phone push
+    # use, so the notification, the badge and the push now all mean the same
+    # thing: the measurement chain is genuinely broken.
+    - if:
+      - condition: template
+        value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
+          >= 3 }}"
+      then:
+      - action: persistent_notification.create
+        continue_on_error: true
+        data:
+          notification_id: guardian_luminance_unusable
+          title: 'Guardian: ambient light sampling failed'
+          message: >-
+            No usable camera for a snapshot (helper
+            "{{ states('input_text.guardian_camera_entity') }}", resolved
+            "{{ camera_entity }}") for
+            {{ states('input_number.guardian_lamp_fail_streak') | int(0) }}
+            samples in a row. The lamp fell back to sun elevation and was
+            {{ 'switched on' if abort_decision | trim == 'on_sun'
+               else ('switched off' if abort_decision | trim == 'off_sun'
+               else 'left as it was') }}. Set More → Install to camera.door_camera
+            and Save. See DEPLOY.md.
+    # script.turn_on, not a blocking call: a phone fan-out must not hold the
+    # sampling flag open towards the 60s watchdog.
     - if:
       - condition: template
         value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
           == 3 }}"
       then:
-      - action: script.guardian_notify_broadcast
+      - action: script.turn_on
         continue_on_error: true
+        target:
+          entity_id: script.guardian_notify_broadcast
         data:
-          category: system
-          severity: routine
-          title: '⚠️ Guardian: ambient light sampling broken'
-          message: >-
-            Three consecutive failed readings. The lamp is running on sun
-            elevation alone. Check input_text.guardian_camera_entity.
+          variables:
+            category: system
+            severity: routine
+            title: '⚠️ Guardian: ambient light sampling broken'
+            message: >-
+              Three consecutive failed readings. The lamp is running on sun
+              elevation alone. Check input_text.guardian_camera_entity.
     - stop: Camera entity is not ready
   - action: input_boolean.turn_on
     target:
@@ -3014,7 +3248,18 @@ guardian_sample_ambient_light:
       value: >-
         {{ ('on|' ~ prev_brightness | int(255) ~ '|' ~ (prev_kelvin | int(0)))
            if was_on | bool else 'off' }}
+  # EVERY lamp call from here to the end of the run is guarded, and that is the
+  # dusk failure the household reported. A cloud bulb that times out or drops
+  # to unavailable mid-call raises HomeAssistantError; unguarded, that ended the
+  # run with guardian_lamp_sampling still on, and "Guardian: Lamp Sampling
+  # Watchdog" restored the pre-sample stash sixty seconds later - which at dusk
+  # is "off", so the porch went dark at exactly the moment the sampler had
+  # decided to light it. The lamp is the actuator, not the measurement: a call
+  # that fails is recorded by the verdict below and retried on the next tick,
+  # never allowed to end the sample. vol.Invalid is not in play - `lamp` is
+  # always a valid id or the `none` sentinel.
   - action: light.turn_off
+    continue_on_error: true
     target:
       entity_id: "{{ lamp }}"
     data:
@@ -3213,6 +3458,7 @@ guardian_sample_ambient_light:
           'on_sun_override'] }}"
       sequence:
       - action: light.turn_on
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -3233,6 +3479,7 @@ guardian_sample_ambient_light:
           'off_sun_override', 'off_day_hold'] }}"
       sequence:
       - action: light.turn_off
+        continue_on_error: true
         target:
           entity_id: "{{ lamp }}"
         data:
@@ -3241,6 +3488,7 @@ guardian_sample_ambient_light:
     # exactly as it was. Daytime band readings are off_day_hold above, not here.
     default:
     - action: script.guardian_restore_lamp
+      continue_on_error: true
       data:
         was_on: '{{ was_on }}'
         prev_brightness: '{{ prev_brightness }}'
@@ -3296,40 +3544,61 @@ guardian_sample_ambient_light:
     else:
     # The fixed notification_id makes this self-replacing, so a persistently
     # broken sampler produces one notification, not one per run.
-    - action: persistent_notification.create
-      data:
-        notification_id: guardian_luminance_unusable
-        title: 'Guardian: ambient light sampling failed'
-        message: >-
-          sensor.guardian_camera_luminance did not produce a fresh number.
-          Reading: {{ states('sensor.guardian_camera_luminance') }}. The lamp
-          fell back to sun elevation and was {{
-            'switched on' if decision | trim == 'on_sun'
-            else ('switched off' if decision | trim == 'off_sun'
-            else 'left as it was') }}. Check, in order:
-          /config/guardian/ exists and is writable; guardian-luminance.py is at
-          /config/guardian/; the camera entity
-          input_text.guardian_camera_entity is correct. See DEPLOY.md.
+    #
+    # And only from the third failure in a row. One miss is the camera
+    # integration blinking, and the verdict line above already records it; a
+    # notification per miss is what made this card a fixture at dusk. Three is
+    # the threshold LUMA and the phone push below already used.
+    - if:
+      - condition: template
+        value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
+          >= 3 }}"
+      then:
+      - action: persistent_notification.create
+        continue_on_error: true
+        data:
+          notification_id: guardian_luminance_unusable
+          title: 'Guardian: ambient light sampling failed'
+          message: >-
+            sensor.guardian_camera_luminance did not produce a fresh number for
+            {{ states('input_number.guardian_lamp_fail_streak') | int(0) }}
+            samples in a row. Reading:
+            {{ states('sensor.guardian_camera_luminance') }}. The lamp fell back
+            to sun elevation and was {{
+              'switched on' if decision | trim == 'on_sun'
+              else ('switched off' if decision | trim == 'off_sun'
+              else 'left as it was') }}. Check, in order:
+            /config/guardian/ exists and is writable; guardian-luminance.py is at
+            /config/guardian/; the camera entity
+            input_text.guardian_camera_entity is correct. See DEPLOY.md.
     # A persistent notification is a badge in the web UI that is easy never to
     # look at - which is how a sampler that had never once worked went unnoticed
     # for months. Three consecutive failures means the chain is genuinely broken
     # rather than the Tapo integration having dropped the camera for one run, so
     # escalate to the phones. Exactly once: the streak only equals 3 on one run.
+    #
+    # script.turn_on, not a blocking call. This still runs with
+    # guardian_lamp_sampling on, and a serial phone fan-out over the network
+    # could hold that flag past the 60s watchdog, which then "recovered" a
+    # sample that had already finished.
     - if:
       - condition: template
         value_template: "{{ states('input_number.guardian_lamp_fail_streak') | int(0)
           == 3 }}"
       then:
-      - action: script.guardian_notify_broadcast
+      - action: script.turn_on
         continue_on_error: true
+        target:
+          entity_id: script.guardian_notify_broadcast
         data:
-          category: system
-          severity: routine
-          title: '⚠️ Guardian: ambient light sampling broken'
-          message: >-
-            Three consecutive failed readings. The lamp is running on sun
-            elevation alone. See the Guardian notification in Home Assistant
-            for what to check.
+          variables:
+            category: system
+            severity: routine
+            title: '⚠️ Guardian: ambient light sampling broken'
+            message: >-
+              Three consecutive failed readings. The lamp is running on sun
+              elevation alone. See the Guardian notification in Home Assistant
+              for what to check.
   # An override means the camera produced a perfectly good number that
   # contradicts the sky. The lamp is now correct either way, but the
   # measurement is not. on_sun_override at night is almost always unconfigured
@@ -3386,22 +3655,28 @@ guardian_sample_ambient_light:
   # from_sampler is required: the sampling flag is still on, and the independent
   # tick treats that flag as "do not force".
   - action: script.guardian_apply_lamp_sun_mismatch
+    continue_on_error: true
     data:
       from_sampler: true
       luminance_valid: '{{ luminance_valid }}'
       luminance: '{{ luminance }}'
+  # Non-blocking for the same reason as the streak push above. The message is
+  # rendered here, at call time, so it still carries this sample's verdict.
   - if:
     - condition: state
       entity_id: input_boolean.guardian_verbose_notifications
       state: 'on'
     then:
-    - action: script.guardian_notify_broadcast
+    - action: script.turn_on
       continue_on_error: true
+      target:
+        entity_id: script.guardian_notify_broadcast
       data:
-        category: system
-        severity: routine
-        title: 'Guardian: lamp'
-        message: "{{ states('input_text.guardian_lamp_last_result') }}"
+        variables:
+          category: system
+          severity: routine
+          title: 'Guardian: lamp'
+          message: "{{ states('input_text.guardian_lamp_last_result') }}"
   - action: input_boolean.turn_off
     target:
       entity_id: input_boolean.guardian_lamp_sampling
@@ -5380,7 +5655,7 @@ guardian_slot_write:
 # alias, so keep the version the final word. It is never called and does
 # nothing; running it is harmless.
 guardian_version_marker:
-  alias: Guardian - Backend Version 2.32.5
+  alias: Guardian - Backend Version 2.33.0
   description: >-
     Version marker for scripts.yaml, read by sensor.guardian_version and shown
     on More -> Diagnostics. Does nothing when run. Bump the version in this

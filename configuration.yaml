@@ -10,7 +10,7 @@ default_config:
 frontend:
   themes: !include_dir_merge_named themes
   extra_module_url:
-    - /local/guardian-ui/set-default-panel.js?v=2.32.5
+    - /local/guardian-ui/set-default-panel.js?v=2.33.0
 
 # The Home Assistant login is the outer gate in front of everything Guardian
 # can do. Guardian scripts also refuse some writes from a second account
@@ -93,7 +93,7 @@ panel_custom:
     sidebar_title: Guardian
     sidebar_icon: mdi:shield-home
     url_path: guardian
-    module_url: /local/guardian-ui/guardian-panel.js?v=2.32.5
+    module_url: /local/guardian-ui/guardian-panel.js?v=2.33.0
     require_admin: false
     config:
       # Fallback for live view when the helper is empty. Live view and lamp

@@ -91,12 +91,12 @@ FAULTS = [
      'persistent_notification.create'),
 
     ('stale automations.yaml reported healthy', 'automations.yaml',
-     "alias: Guardian - Automations Version 2.32.5",
+     "alias: Guardian - Automations Version 2.33.0",
      "alias: Guardian - Automations Version 2.25.0",
      'automations.yaml'),
 
     ('INSTALL.md merge block gone stale', 'INSTALL.md',
-     "guardian-ui/guardian-panel.js?v=2.32.5",
+     "guardian-ui/guardian-panel.js?v=2.33.0",
      "guardian-ui/guardian-panel.js?v=2.25.0",
      'INSTALL.md'),
 
@@ -240,7 +240,7 @@ FAULTS = [
     # Runs preflight with --config-dir . because this check is about the
     # deployed tree; the repo has the same shape, so it stands in for /config.
     ('a deployed tree where only the panel is stale', 'www/guardian-ui/guardian-panel.js',
-     "const GUARDIAN_UI_VERSION = '2.32.5';",
+     "const GUARDIAN_UI_VERSION = '2.33.0';",
      "const GUARDIAN_UI_VERSION = '2.25.0';",
      'deployed files are from different versions',
      ('--config-dir', '.')),
@@ -250,7 +250,7 @@ FAULTS = [
     # checked and the prose naming the number was not, so the one line whose
     # whole job is to state the version was the one line free to be wrong.
     ('INSTALL.md prose names the wrong version', 'INSTALL.md',
-     "they all read\n**2.32.5**:",
+     "they all read\n**2.33.0**:",
      "they all read\n**2.24.0**:",
      'version mismatch across the halves'),
 
@@ -438,7 +438,7 @@ FAULTS = [
     # is the only one the check reads - earlier passes quote what was true when
     # they were written and are deliberately never renumbered.
     ('DEPLOY.md quoting a fault count that cannot happen', 'DEPLOY.md',
-     '`36 of 36 faults caught.`',
+     '`37 of 37 faults caught.`',
      '`23 of 23 faults caught.`',
      'does not produce'),
 
@@ -461,7 +461,7 @@ FAULTS = [
     # say "copy it".
     ('the deployed-tree check telling a household to copy configuration.yaml',
      'configuration.yaml',
-     'guardian-panel.js?v=2.32.5',
+     'guardian-panel.js?v=2.33.0',
      'guardian-panel.js?v=2.25.0',
      'DO NOT COPY configuration.yaml',
      ('--config-dir', '.')),
@@ -501,6 +501,20 @@ FAULTS = [
      '  if (!canEditNotifyPrefs(hass, slot)) {',
      '  if (!canEditSlot(hass, slot)) {',
      'canEditNotifyPrefs'),
+
+    # ---- forty-eighth pass --------------------------------------------------
+
+    # The lamp stash that a restart wiped. guardian_lamp_presample carried
+    # `initial: none`, so the Lamp Sampling Watchdog's homeassistant:start
+    # branch - read through a variable, `stash not in ['', 'none', ...]` - could
+    # never restore the lamp a restart interrupted. The startup-reachable check
+    # only looked for the helper inside the condition itself and passed it. Put
+    # the initial back and preflight must name the watchdog through the variable.
+    ('the lamp stash a restart wiped, read through a variable',
+     'packages/guardian.yaml',
+     "  guardian_lamp_presample:\n    name: Guardian Lamp Pre-Sample State\n    max: 40",
+     "  guardian_lamp_presample:\n    name: Guardian Lamp Pre-Sample State\n    initial: none\n    max: 40",
+     'where stash = states('),
 ]
 
 
