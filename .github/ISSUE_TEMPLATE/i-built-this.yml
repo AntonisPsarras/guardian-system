@@ -1,0 +1,39 @@
+name: I built this
+description: A second household is the actual test. No live credentials.
+title: "[build] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Welcome. This is how Guardian stops being a one-house tree.
+        Still no secrets — see [SECURITY.md](https://github.com/AntonisPsarras/guardian-system/blob/main/SECURITY.md).
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: This report has no live credential
+      options:
+        - label: I have not pasted a secret, RTSP URL, UID, or PIN.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version you flashed / copied
+    validations:
+      required: true
+  - type: checkboxes
+    id: pieces
+    attributes:
+      label: What you built
+      options:
+        - label: Door lantern
+        - label: Interior portal
+        - label: Doorbell
+        - label: Home Assistant tree
+  - type: textarea
+    id: notes
+    attributes:
+      label: What worked, what fought you
+      description: Fit, GPIO, print, fab, INSTALL.md step numbers. Photos of the bench are fine. Not the installed door if you care about that house.
+    validations:
+      required: true

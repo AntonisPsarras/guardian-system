@@ -1,18 +1,28 @@
 # Guardian System
 
-A home security system built on Home Assistant: RFID entry at two doors, a
-keypad-and-display door portal, presence tracking per key, a camera-driven
-door lamp, person detection, and an alarm that reaches phones.
+A local Home Assistant door system: RFID at two doors, a keypad-and-display
+portal, and a porch lantern that does not advertise a camera.
 
 **Start here:** [INSTALL.md](INSTALL.md) — from a fresh Home Assistant to a
-working system.
+working system. **Start with the print:** the lantern. No custom PCB; one
+weekend if you already have a Tapo C110.
+
+Maintainer: [AntonisPsarras](https://github.com/AntonisPsarras).
 
 > Ready with documented caveats. Not a product, not an add-on, not supported.
 > A burglar alarm that fails does so at the worst possible moment. Read the
 > caveats below before you run it. MIT, **as is, without warranty**.
 
+<p align="center">
+  <img src="docs/documentation/readme-loop.gif" alt="Guardian lantern, interior portal, and doorbell" />
+</p>
+
 <table>
   <tr>
+    <td align="center" valign="top" width="34%">
+      <img src="docs/documentation/door-lamp-camera/images/readme.jpg" alt="Door lamp and camera housing" />
+      <br /><strong>Door lantern</strong>
+    </td>
     <td align="center" valign="top" width="33%">
       <img src="docs/documentation/interior-portal/images/readme.jpg" alt="Interior portal mounted on the wall" />
       <br /><strong>Interior portal</strong>
@@ -20,10 +30,6 @@ working system.
     <td align="center" valign="top" width="33%">
       <img src="docs/documentation/doorbell/images/readme.jpg" alt="Outdoor doorbell mounted on the wall" />
       <br /><strong>Doorbell</strong>
-    </td>
-    <td align="center" valign="top" width="33%">
-      <img src="docs/documentation/door-lamp-camera/images/readme.jpg" alt="Door lamp and camera housing" />
-      <br /><strong>Door lamp</strong>
     </td>
   </tr>
 </table>
@@ -37,11 +43,11 @@ Step-by-step assembly with more photographs is in
    and has never been heard. Until you flash it and hear it, jamming
    2.4 GHz or stopping Home Assistant silences the house. Cutting power
    to the portal still does: authority is RAM-only.
-2. **Printable as 3MF profiles; Gerbers for a proto fab; not
-   pick-and-place.** Print files live on MakerWorld and Printables.
-   `PCBs/` has KiCad source plus Gerber+drill zips. There is no CPL.
-   The door lamp has no PCB — commercial bulb + camera in a printed
-   housing.
+2. **Printable as 3MF profiles plus generic STLs; Gerbers for a proto
+   fab; not pick-and-place.** Print files live on MakerWorld,
+   Printables, and Thingiverse. `PCBs/` has KiCad source plus
+   Gerber+drill zips. There is no CPL. The door lamp has no PCB —
+   commercial bulb + camera in a printed housing.
 3. **The outdoor unit holds the card master key in cleartext flash until
    you opt into flash encryption.** That burn is irreversible; a first
    flash over OTA would brick the board. See INSTALL.md § Flash
@@ -85,13 +91,16 @@ only way to run it is a real Home Assistant instance and real hardware.
 
 ## Print files
 
-Meshes are not in this tree. Download the Bambu Studio profile for each
-device from the [MakerWorld collection](https://makerworld.com/en/collections/36079462-guardian-system)
-or the [Printables collection](https://www.printables.com/@AntoniJuveni_3576373/collections/3780824):
+Meshes are not in this tree. Each listing is a Bambu Studio `.3mf` plus a
+generic STL zip for slicers that are not Bambu. Start with the lantern.
+
+[MakerWorld collection](https://makerworld.com/en/collections/36079462-guardian-system)
+· [Printables collection](https://www.printables.com/@AntoniJuveni_3576373/collections/3780824)
+(account `@AntoniJuveni_3576373`; the project handle is AntonisPsarras)
 
 | Device | Profile | MakerWorld | Printables |
 |---|---|---|---|
-| Door lamp (Tapo C110 + L530E) | `Lamp-Final.3mf` | [listing](https://makerworld.com/en/models/3347455-guardian-door-lamp-housing-tapo-c110-lantern) | [listing](https://www.printables.com/model/1853736-guardian-door-lantern-tapo-c110-camera-l530e-hidde) |
+| Door lantern (Tapo C110 + L530E) | `Lamp-Final.3mf` | [listing](https://makerworld.com/en/models/3347455-guardian-door-lamp-housing-tapo-c110-lantern) | [listing](https://www.printables.com/model/1853736-guardian-door-lantern-tapo-c110-camera-l530e-hidde) |
 | Interior portal | `Internal-Portal-Final.3mf` | [listing](https://makerworld.com/en/models/3347482-guardian-interior-portal-keypad-and-display) | [listing](https://www.printables.com/model/1853748-guardian-interior-portal-esp32-s3-keypad-rfid-disp) |
 | Doorbell | `Doorbell-Final.3mf` | [listing](https://makerworld.com/en/models/3347498-guardian-outdoor-doorbell-housing-esp32-c6) | [listing](https://www.printables.com/model/1853742-guardian-outdoor-doorbell-housing-esp32-c6) |
 
@@ -104,7 +113,7 @@ or the [Printables collection](https://www.printables.com/@AntoniJuveni_3576373/
 | [`docs/documentation/`](docs/documentation/) | Assembly photographs, soldering order, and a printable PDF per device. |
 | [`docs/bom.md`](docs/bom.md) | One-page parts checklist. Not a pick-and-place file. |
 | [`PCBs/`](PCBs/) | Two KiCad 10 projects and Gerber+drill zips. |
-| [`3D-Models/`](3D-Models/) | Where the print files live (MakerWorld / Printables). This tree does not ship STLs. |
+| [`3D-Models/`](3D-Models/) | Where the print files live (MakerWorld / Printables / Thingiverse). This tree does not ship meshes. |
 | [`SECURITY.md`](SECURITY.md) | How to report a problem, and what not to paste into an issue. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Preflight, selftest, and how to propose a change. |
 | [`DEPLOY.md`](DEPLOY.md) | Maintainer changelog **and** manual test plan. |
@@ -175,15 +184,14 @@ panel, the offline watchdogs.
 
 **Known gaps, deliberately not hidden:**
 
-- Print files are 3MF profiles on MakerWorld / Printables; Gerbers are
-  in `PCBs/`. Not pick-and-place.
+- Print files are 3MF profiles plus generic STL zips on MakerWorld /
+  Printables / Thingiverse; Gerbers are in `PCBs/`. Not pick-and-place.
 - Card-crypto and torn-rotate fixes are in the tree and **unverified
   against a real card** since those passes.
 - The offline local siren compiles and **has never been heard**.
 - Tamper detection needs a portal reflash.
 - The alarm path is unverified on hardware since the last several
-  passes. `INSTALL.md` §9 and `DEPLOY.md` numbered steps remain the
-  proof.
+  passes. `INSTALL.md` §9 remains the proof.
 - Frigate integrates over raw MQTT, not the native integration.
 - Single-household provenance. This has only ever run on one
   installation.
@@ -191,6 +199,16 @@ panel, the offline watchdogs.
 Early private git history contained a household LAN address and a camera
 RTSP URL. This public repository was seeded from a cleaned tree; that
 log is not here. If those credentials were ever live, rotate them.
+
+## Support
+
+This is unpaid and unsupported. If you still want to buy coffee:
+
+- GitHub Sponsors on this repository (see `.github/FUNDING.yml`)
+- A Ko-fi link will be added here when that account exists
+
+[`docs/bom.md`](docs/bom.md) has no affiliate tags. If any appear later,
+they will be disclosed in that file.
 
 ## License
 

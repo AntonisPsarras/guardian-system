@@ -1,0 +1,54 @@
+name: Problem
+description: A fault, a failed verify step, or a doc error. No live credentials.
+title: "[v] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [SECURITY.md](https://github.com/AntonisPsarras/guardian-system/blob/main/SECURITY.md)
+        first. Do not paste Wi-Fi, ESPHome keys, `guardian_rfid_mac_key`,
+        RTSP URLs, MQTT passwords, Home Assistant tokens, PINs, card UIDs,
+        or a dump of `esphome/secrets.yaml` / `frigate/config.yml`.
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: This report has no live credential
+      options:
+        - label: I have not pasted a secret, URL-with-password, UID, or PIN.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Panel footer or the version literal in packages/guardian.yaml.
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Install / files on disk
+        - RFID / keys
+        - Alarm / siren / notifications
+        - Tamper / door sensors
+        - Lamp / camera / Frigate
+        - Print / PCB / hardware
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Class of issue, not a credential. Name the INSTALL.md or DEPLOY.md step if you have one.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true

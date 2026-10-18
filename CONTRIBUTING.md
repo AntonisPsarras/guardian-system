@@ -57,5 +57,3 @@ Never `git add -f` a secrets file.
 - Bump every version literal together (preflight will refuse a split).
 - If the change is a deploy-affecting fix, add a short `DEPLOY.md` note
   with what changed and how to verify it.
-- Hardware / print listing copy lives in
-  [`docs/maintainers/print-listings.md`](docs/maintainers/print-listings.md).

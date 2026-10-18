@@ -41,7 +41,7 @@ locally.
 | `docs/` | Hardware index ([`docs/README.md`](../README.md)): assembly, printable PDFs, parts checklist, DFPlayer tracks. |
 | `docs/documentation/` | Assembly markdown, photographs, and a printable PDF for the interior portal, doorbell, and lamp+camera. Linked from INSTALL §1 and `3D-Models/README.md`. |
 | `PCBs/` | KiCad 10 projects and Gerber+drill zips (`Interior-Portal/`, `Doorbell/`). `PCBs/README.md` is the fab + BOM note. |
-| `3D-Models/` | Index only. Print files are the three `.3mf` profiles on MakerWorld / Printables. This tree does not ship STLs. |
+| `3D-Models/` | Index only. Print files are the three `.3mf` profiles plus generic STL zips on MakerWorld / Printables / Thingiverse. This tree does not ship meshes. |
 | `secrets.yaml.example` | A signpost, not a template: Guardian's Home Assistant config references **no** `!secret` keys. Points at the three real credential surfaces (`esphome/secrets.yaml`, Frigate add-on env vars, the master PIN). |
 | `DEPLOY.md` | Release notes + deployment runbook, written pass-by-pass (each "pass" = a batch of commits). Explains *why* each fix was needed, what new helpers/entities it introduces, exact manual verification steps, and network/Frigate troubleshooting notes. This is the changelog **and** the test plan — there is no automated test suite, so DEPLOY.md's "Verify" checklists are the closest thing to one. |
 | `docs/reference-images/` | Local-only source photography of one install. Not in the public tree. Assembly steps live in `docs/documentation/`. |
